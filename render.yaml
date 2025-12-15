@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python ict_bot.py
     autoDeploy: true
     envVars:
       - key: TG_TOKEN
