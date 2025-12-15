@@ -52,7 +52,21 @@ exchange = ccxt.bybit({
     "secret": BYBIT_API_SECRET or "",
     "options": {"defaultType": "swap"}  # USDT Perpetual
 })
+async def load_all_usdt_perp_symbols() -> tuple[str, ...]:
+    def _load():
+        exchange.load_markets()
+        symbols = []
+        for m in exchange.markets.values():
+            if (
+                m.get("quote") == "USDT"
+                and m.get("swap") is True
+                and m.get("active") is True
+            ):
+                symbols.append(m["symbol"].replace("/", "").replace(":USDT", ""))
+        return tuple(sorted(set(symbols)))
 
+    return await asyncio.to_thread(_load)
+  
 # ==============================
 # ✅ CONFIG (як у твоєму Pine)
 # ==============================
@@ -88,8 +102,9 @@ class SniperConfig:
 
     # Bot specifics
     timeframe: str = "15m"
-    scan_interval_sec: int = 30
-    symbols: Tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "ONDOUSDT", "MNTUSDT", "APEXUSDT")
+    scan_interval_sec: int = 60
+    symbols: Tuple[str, ...] = ()
+    universe: str = "all"   # all | custom
 
 
 STATE: Dict[str, object] = {
@@ -644,6 +659,14 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Сканер вже працює ✅")
         return
     STATE["running"] = True
+
+cfg = STATE["cfg"]
+if cfg.universe == "all":
+    await update.message.reply_text("🔎 Завантажую всі USDT Perpetual пари з Bybit...")
+    STATE["ALL_SYMBOLS"] = await load_all_usdt_perp_symbols()
+    await update.message.reply_text(
+        f"✅ Завантажено {len(STATE['ALL_SYMBOLS'])} пар"
+    )
     STATE["chat_id"] = update.effective_chat.id
 
     task = asyncio.create_task(scanner_loop(context.application))
@@ -676,7 +699,11 @@ async def scanner_loop(app: Application) -> None:
             await asyncio.sleep(cfg.scan_interval_sec)
             continue
 
-        for symbol in cfg.symbols:
+        symbols = cfg.symbols
+if cfg.universe == "all" or not symbols:
+    symbols = STATE.get("ALL_SYMBOLS", ())
+
+for symbol in symbols:
             try:
                 df = await fetch_ohlcv(symbol, cfg.timeframe, limit=350)
                 res = compute_signal(df, cfg)
@@ -724,3 +751,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
