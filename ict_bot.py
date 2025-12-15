@@ -1,3 +1,4 @@
+
 # ==============================
 # ICT SNIPER SCANNER — BYBIT USDT PERP
 # Alpha Engine v4 logic (A/B/C + SL/TP) — Python port (core)
@@ -39,7 +40,7 @@ STATE = {
 
     "tfs": ["5m", "15m", "1h"],
 
-    "universe": "all",
+    "universe": "top100",
     "whitelist": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
 
     "only_close": True,
@@ -65,7 +66,7 @@ STATE = {
     "last_signal": {}
 }
 
-scanner_task = None
+
 
 # ==============================
 # 🧮 Helpers: EMA / ATR / pivots
@@ -580,14 +581,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_startscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global scanner_task
-
     STATE["chat_id"] = update.effective_chat.id
     STATE["running"] = True
-
-    if scanner_task is None or scanner_task.done():
-        scanner_task = asyncio.create_task(scanner_loop(context.application))
-
     await update.message.reply_text("Сканер запущено ✅")
 
 async def cmd_stopscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -627,10 +622,12 @@ def main():
     app.add_handler(CommandHandler("tfs", cmd_tfs))
     app.add_handler(CommandHandler("universe", cmd_universe))
 
-    
-    app.run_polling()
+    # запускаємо scanner loop як background task всередині event loop PTB
+    async def post_init(application: Application):
+        application.create_task(scanner_loop(application))
+
+    app.post_init = post_init
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
-
-
