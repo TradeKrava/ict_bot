@@ -1,11 +1,10 @@
 services:
   - type: worker
-    name: ict-bot
-    env: python
+    name: ict-sniper-bot
+    runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python ict_bot.py
-    autoDeploy: true
     envVars:
-      - key: TG_TOKEN
-        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
