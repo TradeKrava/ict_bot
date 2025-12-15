@@ -3,6 +3,7 @@
 # Alpha Engine v4 logic (A/B/C + SL/TP) — Python port (core)
 # python-telegram-bot v21+
 # ==============================
+
 import os
 import asyncio
 import math
@@ -64,6 +65,10 @@ STATE = {
     "last_signal": {}
 }
 
+# ==============================
+# ✅ GLOBAL CACHE (важливо)
+# ==============================
+MARKETS = None   # load_markets() завантажимо 1 раз при старті
 
 
 # ==============================
@@ -83,7 +88,6 @@ def atr(df: pd.DataFrame, length: int) -> pd.Series:
     return true_range(df).ewm(span=length, adjust=False).mean()
 
 def pivot_high(high: pd.Series, left: int, right: int) -> pd.Series:
-    # Pine ta.pivothigh(high, L, L): значення з'являється на барі (t), але відноситься до t-L
     n = len(high)
     out = np.full(n, np.nan)
     for i in range(left, n - right):
@@ -103,8 +107,9 @@ def pivot_low(low: pd.Series, left: int, right: int) -> pd.Series:
             out[i] = l
     return pd.Series(out, index=low.index)
 
+
 # ==============================
-# 📦 Data fetch
+# 📦 Data fetch (✅ non-blocking)
 # ==============================
 async def fetch_ohlcv(symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
     loop = asyncio.get_running_loop()
@@ -118,6 +123,7 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     return df
 
+
 # ==============================
 # 🧠 CORE LOGIC: Alpha Engine v4 (signals + SL/TP)
 # ==============================
@@ -125,8 +131,8 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
 class SignalResult:
     symbol: str
     tf: str
-    direction: str          # "BUY" or "SELL"
-    entry_style: str        # "A — Conservative" / "B — Normal" / "C — Aggressive"
+    direction: str
+    entry_style: str
     entry: float
     sl: float
     tp1: float
@@ -135,8 +141,6 @@ class SignalResult:
     info: dict
 
 def compute_last_fvg_levels(df: pd.DataFrame):
-    # bullFVG = high[2] < low  -> lastBullFVG := low
-    # bearFVG = low[2] > high  -> lastBearFVG := high
     lastBullFVG = np.nan
     lastBearFVG = np.nan
     highs = df["high"].values
@@ -165,10 +169,7 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
                 manip_flag: bool,
                 trendBull: bool, trendBear: bool,
                 ch50: float) -> tuple[float,float,float,float,float]:
-    """
-    Порт SL/TP частини з Pine (для нового сигналу).
-    idx - індекс останньої закритої свічки.
-    """
+
     close = float(df.loc[idx, "close"])
     high  = float(df.loc[idx, "high"])
     low   = float(df.loc[idx, "low"])
@@ -176,10 +177,8 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
     atr5 = float(df.loc[idx, "atr5"])
     atr14 = float(df.loc[idx, "atr14"])
 
-    # 1) styleMult
     styleMult = 0.5 if slStyle == "Aggressive" else (1.0 if slStyle == "Normal" else 1.5)
 
-    # 2) dynMult (спрощено 1:1 за умовами Pine)
     dynMult = 1.0
     if manip_flag:
         dynMult += 0.4
@@ -200,7 +199,6 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
     entry = close
 
     if dir_active == 1:
-        # BUY
         refLow1 = low
         refLow2 = low if math.isnan(lastLow) else lastLow
 
@@ -240,7 +238,7 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
             tp1 = tp1_R if math.isnan(structNear) else structNear
             tp2 = tp2_R if math.isnan(structFar)  else structFar
             tp3 = tp3_R
-        else:  # Combined
+        else:
             tp1 = tp1_R
             tp2 = tp2_R if math.isnan(structNear) else structNear
             tp3 = tp3_R if math.isnan(structFar)  else structFar
@@ -248,7 +246,6 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
         return entry, sl, tp1, tp2, tp3
 
     else:
-        # SELL
         refHigh1 = high
         refHigh2 = high if math.isnan(lastHigh) else lastHigh
 
@@ -288,22 +285,20 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
             tp1 = tp1_R if math.isnan(structNear) else structNear
             tp2 = tp2_R if math.isnan(structFar)  else structFar
             tp3 = tp3_R
-        else:  # Combined
+        else:
             tp1 = tp1_R
             tp2 = tp2_R if math.isnan(structNear) else structNear
             tp3 = tp3_R if math.isnan(structFar)  else structFar
 
         return entry, sl, tp1, tp2, tp3
 
+
 def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | None:
-    # Працюємо по останній ЗАКРИТІЙ свічці
     if len(df) < 220:
         return None
 
-    # якщо only_close: беремо передостанній рядок (бо останній може формуватись)
     idx = df.index[-2] if STATE["only_close"] else df.index[-1]
 
-    # ---------------- PD ----------------
     pdLen = STATE["pdLen"]
     window = df.loc[:idx].tail(pdLen)
     sHigh = float(window["high"].max())
@@ -317,21 +312,17 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
     inDiscount = close < midPD
     inPremium  = close > midPD
 
-    # ---------------- sweeps (liq) ----------------
-    prev5 = df.loc[:idx].tail(6).iloc[:-1]  # 5 барів ДО поточного
+    prev5 = df.loc[:idx].tail(6).iloc[:-1]
     liqLow  = low  < float(prev5["low"].min())
     liqHigh = high > float(prev5["high"].max())
 
-    # ---------------- ATR pass ----------------
     atr14 = float(df.loc[idx, "atr14"])
     atrPass = (not STATE["use_atr"]) or ((high - low) >= atr14 * 0.8)
 
-    # ---------------- FVG ----------------
     lastBullFVG, lastBearFVG = compute_last_fvg_levels(df.loc[:idx].copy())
-    bullRetestFVG_A = retest_bull_fvg(lastBearFVG, low, close)   # bull ретест верхнього FVG
-    bearRetestFVG_A = retest_bear_fvg(lastBullFVG, high, close)  # bear ретест нижнього FVG
+    bullRetestFVG_A = retest_bull_fvg(lastBearFVG, low, close)
+    bearRetestFVG_A = retest_bear_fvg(lastBullFVG, high, close)
 
-    # ---------------- EMA filters ----------------
     ema9   = float(df.loc[idx, "ema9"])
     ema21  = float(df.loc[idx, "ema21"])
     ema50  = float(df.loc[idx, "ema50"])
@@ -346,26 +337,19 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
     finalBull_OK = (not STATE["use_ema_trend"] or trendBull) and (not STATE["use_ema_confirm"] or confirmBull)
     finalBear_OK = (not STATE["use_ema_trend"] or trendBear) and (not STATE["use_ema_confirm"] or confirmBear)
 
-    # ---------------- STRUCT pivots + lastHigh/lastLow ----------------
-    # Піводи вже пораховані в df["ph"]/df["pl"]
     sub = df.loc[:idx]
     lastHigh = sub["lastHigh"].iloc[-1]
     lastLow  = sub["lastLow"].iloc[-1]
 
-    # ---------------- BOS ICT ----------------
     bosLookback = STATE["bosLookback"]
     prevN = sub.tail(bosLookback + 1).iloc[:-1]
     bosUpIct   = liqLow  and (close > float(prevN["high"].max()))
     bosDownIct = liqHigh and (close < float(prevN["low"].min()))
 
-    # ---------------- Manip (SPRING/UTAD) ----------------
-    # У Pine: bosUpAfterSweep = sweepLow and close > lastHigh
-    # Тут: якщо є sweepLow і lastHigh валідний і close вище
     manipBuy = STATE["use_manip"] and liqLow and (not pd.isna(lastHigh)) and (close > float(lastHigh))
     manipSell = STATE["use_manip"] and liqHigh and (not pd.isna(lastLow)) and (close < float(lastLow))
     manip_flag = manipBuy or manipSell
 
-    # ---------------- Entry A/B/C ----------------
     usePD = STATE["use_pd"]
     useFVG = STATE["use_fvg"]
 
@@ -398,11 +382,9 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
     if not (bullSignal or bearSignal):
         return None
 
-    # ---------------- SL/TP ----------------
     if not STATE["use_sltp"]:
         return None
 
-    # ch50 як у Pine: ta.change(ema50,5)/ema50*100
     ema50_prev5 = float(sub["ema50"].iloc[-6]) if len(sub) >= 6 else ema50
     ch50 = (ema50 - ema50_prev5) / ema50 * 100.0 if ema50 != 0 else 0.0
 
@@ -439,6 +421,7 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
         info=info
     )
 
+
 def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -450,26 +433,20 @@ def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr14"] = atr(df, 14)
     df["atr5"] = atr(df, 5)
 
-    # pivots
     L = STATE["structLen"]
     df["ph"] = pivot_high(df["high"], L, L)
     df["pl"] = pivot_low(df["low"], L, L)
 
-    # lastHigh/lastLow як var в Pine
     lastHigh = np.nan
-    prevHigh = np.nan
     lastLow  = np.nan
-    prevLow  = np.nan
 
     lastHigh_arr = []
     lastLow_arr = []
 
     for i in range(len(df)):
         if not math.isnan(df["ph"].iloc[i]):
-            prevHigh = lastHigh
             lastHigh = float(df["ph"].iloc[i])
         if not math.isnan(df["pl"].iloc[i]):
-            prevLow = lastLow
             lastLow = float(df["pl"].iloc[i])
         lastHigh_arr.append(lastHigh)
         lastLow_arr.append(lastLow)
@@ -478,25 +455,28 @@ def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["lastLow"] = lastLow_arr
     return df
 
+
 # ==============================
-# 🔎 SYMBOL UNIVERSE
+# 🔎 SYMBOL UNIVERSE (✅ NO load_markets in loop)
 # ==============================
 def get_symbols() -> list[str]:
+    global MARKETS
+
     if STATE["universe"] == "whitelist":
         return STATE["whitelist"]
 
-    markets = exchange.load_markets()
+    if not MARKETS:
+        return []
+
     syms = []
-    for s, m in markets.items():
-        # USDT swap symbols на Bybit в ccxt часто виглядають як "BTC/USDT:USDT"
+    for s, m in MARKETS.items():
         if m.get("swap") and m.get("quote") == "USDT":
             syms.append(s)
 
-    # top100: приблизно по об'єму не візьмемо ідеально без дод. API,
-    # тому робимо pragmatic: просто перші 100 (або можеш замінити на tickers+sort).
     if STATE["universe"] == "top100":
         return syms[:100]
     return syms
+
 
 # ==============================
 # 📣 Telegram messaging
@@ -518,7 +498,6 @@ async def send_signal(app: Application, chat_id: int, sig: SignalResult, bar_ts:
     key = (sig.symbol, sig.tf, sig.direction)
     last = STATE["last_signal"].get(key)
 
-    # антидубль: той же бар — не шлемо
     ts_ms = int(bar_ts.value // 10**6)
     if last == ts_ms:
         return
@@ -526,8 +505,9 @@ async def send_signal(app: Application, chat_id: int, sig: SignalResult, bar_ts:
     STATE["last_signal"][key] = ts_ms
     await app.bot.send_message(chat_id=chat_id, text=format_signal(sig), parse_mode="Markdown")
 
+
 # ==============================
-# 🔁 Scanner loop
+# 🔁 Scanner loop (✅ logs + safer)
 # ==============================
 async def scanner_loop(app: Application):
     while True:
@@ -537,6 +517,11 @@ async def scanner_loop(app: Application):
 
         try:
             symbols = get_symbols()
+            if not symbols:
+                print("[WARN] symbols empty (markets not loaded yet?)")
+                await asyncio.sleep(2.0)
+                continue
+
             for symbol in symbols:
                 if not STATE["running"]:
                     break
@@ -551,23 +536,22 @@ async def scanner_loop(app: Application):
 
                         sig = analyze_symbol(df, symbol, tf)
                         if sig:
-                            # останній закритий бар
                             idx = df.index[-2] if STATE["only_close"] else df.index[-1]
                             bar_ts = df.loc[idx, "ts"]
                             await send_signal(app, STATE["chat_id"], sig, bar_ts)
 
-                        # маленька пауза щоб не душити rate limit
                         await asyncio.sleep(0.08)
 
-                    except Exception:
-                        # щоб не падало через одну пару
+                    except Exception as e:
+                        print(f"[PAIR ERROR] {symbol} {tf} -> {repr(e)}")
                         continue
 
-            # пауза між повними проходами (під твій стиль)
             await asyncio.sleep(3.0)
 
-        except Exception:
-            await asyncio.sleep(3.0)
+        except Exception as e:
+            print(f"[SCANNER ERROR] {repr(e)}")
+            await asyncio.sleep(5.0)
+
 
 # ==============================
 # 🤖 Telegram commands
@@ -615,6 +599,29 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Використання: /universe top100|all|whitelist")
 
+
+# ==============================
+# 🔒 SINGLE INSTANCE LOCK (✅ prevents Conflict)
+# ==============================
+_LOCK_FD = None
+
+def acquire_lock_or_hold_forever():
+    """
+    Якщо випадково запустився 2й інстанс — НЕ стартуємо polling.
+    Тримаємо процес живим (health OK), щоб Render не рестартив по колу.
+    """
+    global _LOCK_FD
+    lock_path = "/tmp/ict_bot.lock"
+    try:
+        _LOCK_FD = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(_LOCK_FD, str(os.getpid()).encode())
+        print("[LOCK] acquired")
+        return True
+    except FileExistsError:
+        print("[LOCK] already running elsewhere -> hold forever (no polling)")
+        return False
+
+
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -625,16 +632,28 @@ def main():
     app.add_handler(CommandHandler("tfs", cmd_tfs))
     app.add_handler(CommandHandler("universe", cmd_universe))
 
-    # запускаємо scanner loop як background task всередині event loop PTB
     async def post_init(application: Application):
+        # ✅ load_markets 1 раз, НЕ в loop
+        global MARKETS
+        loop = asyncio.get_running_loop()
+        try:
+            MARKETS = await loop.run_in_executor(None, exchange.load_markets)
+            print(f"[MARKETS] loaded: {len(MARKETS)}")
+        except Exception as e:
+            MARKETS = None
+            print(f"[MARKETS ERROR] {repr(e)}")
+
         application.create_task(scanner_loop(application))
 
     app.post_init = post_init
     app.run_polling(close_loop=False)
 
+
+# ==============================
+# 🩺 Render Health server
+# ==============================
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import os
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -647,8 +666,19 @@ def start_http_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
+def hold_forever():
+    # тримаємо контейнер живим
+    while True:
+        try:
+            asyncio.run(asyncio.sleep(3600))
+        except Exception:
+            pass
+
 if __name__ == "__main__":
     threading.Thread(target=start_http_server, daemon=True).start()
+
+    # ✅ lock: якщо це “другий інстанс” — polling не стартує
+    if not acquire_lock_or_hold_forever():
+        hold_forever()
+
     main()
-
-
