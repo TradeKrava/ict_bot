@@ -628,5 +628,22 @@ def main():
     app.post_init = post_init
     app.run_polling(close_loop=False)
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def start_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
 if __name__ == "__main__":
+    threading.Thread(target=start_http_server, daemon=True).start()
     main()
+
