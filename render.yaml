@@ -1,6 +1,6 @@
 services:
-  - type: web
-    name: ict-sniper-bot
+  - type: worker
+    name: ict-bot
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
