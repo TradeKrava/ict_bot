@@ -3,7 +3,6 @@
 # Alpha Engine v4 logic (A/B/C + SL/TP) — Python port (core)
 # python-telegram-bot v21+
 # ==============================
-
 import os
 import asyncio
 import math
@@ -108,8 +107,13 @@ def pivot_low(low: pd.Series, left: int, right: int) -> pd.Series:
 # 📦 Data fetch
 # ==============================
 async def fetch_ohlcv(symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
-    # ccxt sync -> в asyncio винесемо в thread, але для простоти тут run_in_executor не робимо.
-    data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+    loop = asyncio.get_running_loop()
+
+    data = await loop.run_in_executor(
+        None,
+        lambda: exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+    )
+
     df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     return df
@@ -646,4 +650,5 @@ def start_http_server():
 if __name__ == "__main__":
     threading.Thread(target=start_http_server, daemon=True).start()
     main()
+
 
