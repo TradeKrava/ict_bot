@@ -1,379 +1,299 @@
+"""
+Alpha Engine v4 — PRO ICT Sniper 2025 (Telegram Bot)
+- Bybit USDT Perpetual (ccxt)
+- python-telegram-bot v21+
 
-# ==============================
-# ICT SNIPER SCANNER — BYBIT USDT PERP
-# Alpha Engine v4 logic (A/B/C + SL/TP) — Python port (core)
-# python-telegram-bot v21+
-# ==============================
+ВАЖЛИВО:
+  1) Set env var TG_TOKEN with your bot token (НЕ хардкодь токен в коді).
+  2) (Опційно) BYBIT_API_KEY / BYBIT_API_SECRET якщо буде жорсткий rate limit (публічні дані теж працюють).
+
+Run:
+  pip install python-telegram-bot==21.* ccxt pandas numpy
+  python bot.py
+"""
+
+from __future__ import annotations
 
 import os
-import asyncio
 import math
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
 import ccxt
 import numpy as np
 import pandas as pd
 
-from dataclasses import dataclass
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
 # ==============================
 # 🔑 TELEGRAM TOKEN
 # ==============================
-TOKEN = os.getenv("TG_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Set TG_TOKEN env var")
+TG_TOKEN = os.getenv("TG_TOKEN")
+if not TG_TOKEN:
+    raise RuntimeError("Set TG_TOKEN env var (do NOT hardcode your token).")
 
 # ==============================
 # 📊 BYBIT (USDT PERP)
 # ==============================
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+
 exchange = ccxt.bybit({
     "enableRateLimit": True,
+    "apiKey": BYBIT_API_KEY or "",
+    "secret": BYBIT_API_SECRET or "",
     "options": {"defaultType": "swap"}  # USDT Perpetual
 })
 
 # ==============================
-# ⚙️ STATE (як у твоєму стилі)
+# ✅ CONFIG (як у твоєму Pine)
 # ==============================
-STATE = {
+
+@dataclass
+class SniperConfig:
+    # BASIC INPUTS
+    onlyClose: bool = True
+    useTrend: bool = True                 # legacy, залишив для паритету
+    usePD: bool = True
+    useLiq: bool = True                   # legacy, sweep рахується
+    useFVG: bool = True
+    useATR: bool = True
+
+    pdLen: int = 50
+    bosLookback: int = 5
+    structLen: int = 3
+
+    # EMA FILTERS
+    useEMAtrend: bool = True              # 🔥 EMA 50/200 тренд
+    useEMAconfirm: bool = True            # 🔥 EMA 9/21 підтвердження
+
+    # MANIPULATIONS
+    useManip: bool = True
+    useManipLabels: bool = True           # для бота: писати в тексті
+
+    # SL/TP
+    useSLA: bool = True
+    slStyle: str = "Normal"               # Aggressive/Normal/Safe
+    tpStyle: str = "Combined"             # R-multiple/Structural/Combined
+    usePartial: bool = True
+    baseAtrMult: float = 0.6
+
+    # Bot specifics
+    timeframe: str = "15m"
+    scan_interval_sec: int = 30
+    symbols: Tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "ONDOUSDT", "MNTUSDT", "APEXUSDT")
+
+
+STATE: Dict[str, object] = {
     "running": False,
     "chat_id": None,
-
-    "tfs": ["5m", "15m", "1h"],
-
-    "universe": "top100",
-    "whitelist": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
-
-    "only_close": True,
-
-    "use_pd": False,
-    "use_atr": True,
-    "use_fvg": True,
-    "use_manip": False,
-
-    "use_ema_trend": True,
-    "use_ema_confirm": False,
-
-    "pdLen": 50,
-    "bosLookback": 5,
-    "structLen": 3,
-
-    "use_sltp": True,
-    "slStyle": "Normal",
-    "tpStyle": "Combined",
-    "usePartial": True,
-    "baseAtrMult": 0.6,
-
-    "last_signal": {}
+    "task": None,
+    "last_signal": {},   # key=(symbol, tf) -> {"ts": int, "side": "BUY"/"SELL"}
+    "cfg": SniperConfig(),
 }
 
-
-
 # ==============================
-# 🧮 Helpers: EMA / ATR / pivots
+# 🧮 INDICATORS
 # ==============================
+
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
-def true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-def atr(df: pd.DataFrame, length: int) -> pd.Series:
-    return true_range(df).ewm(span=length, adjust=False).mean()
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(length, min_periods=length).mean()
 
 def pivot_high(high: pd.Series, left: int, right: int) -> pd.Series:
-    # Pine ta.pivothigh(high, L, L): значення з'являється на барі (t), але відноситься до t-L
     n = len(high)
-    out = np.full(n, np.nan)
+    out = pd.Series([np.nan] * n, index=high.index, dtype="float64")
+    arr = high.to_numpy()
     for i in range(left, n - right):
-        window = high.iloc[i - left:i + right + 1]
-        h = high.iloc[i]
-        if h == window.max() and (window == h).sum() == 1:
-            out[i] = h
-    return pd.Series(out, index=high.index)
+        win = arr[i - left : i + right + 1]
+        if np.isnan(arr[i]):
+            continue
+        if arr[i] == np.nanmax(win) and (win == arr[i]).sum() == 1:
+            out.iat[i] = arr[i]
+    return out
 
 def pivot_low(low: pd.Series, left: int, right: int) -> pd.Series:
     n = len(low)
-    out = np.full(n, np.nan)
+    out = pd.Series([np.nan] * n, index=low.index, dtype="float64")
+    arr = low.to_numpy()
     for i in range(left, n - right):
-        window = low.iloc[i - left:i + right + 1]
-        l = low.iloc[i]
-        if l == window.min() and (window == l).sum() == 1:
-            out[i] = l
-    return pd.Series(out, index=low.index)
+        win = arr[i - left : i + right + 1]
+        if np.isnan(arr[i]):
+            continue
+        if arr[i] == np.nanmin(win) and (win == arr[i]).sum() == 1:
+            out.iat[i] = arr[i]
+    return out
 
-# ==============================
-# 📦 Data fetch
-# ==============================
-async def fetch_ohlcv(symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
-    # ccxt sync -> в asyncio винесемо в thread, але для простоти тут run_in_executor не робимо.
-    data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    return df
-
-# ==============================
-# 🧠 CORE LOGIC: Alpha Engine v4 (signals + SL/TP)
-# ==============================
-@dataclass
-class SignalResult:
-    symbol: str
-    tf: str
-    direction: str          # "BUY" or "SELL"
-    entry_style: str        # "A — Conservative" / "B — Normal" / "C — Aggressive"
-    entry: float
-    sl: float
-    tp1: float
-    tp2: float
-    tp3: float
-    info: dict
-
-def compute_last_fvg_levels(df: pd.DataFrame):
-    # bullFVG = high[2] < low  -> lastBullFVG := low
-    # bearFVG = low[2] > high  -> lastBearFVG := high
-    lastBullFVG = np.nan
-    lastBearFVG = np.nan
-    highs = df["high"].values
-    lows = df["low"].values
-    for i in range(2, len(df)):
-        bullFVG = highs[i-2] < lows[i]
-        bearFVG = lows[i-2] > highs[i]
-        if bullFVG:
-            lastBullFVG = lows[i]
-        if bearFVG:
-            lastBearFVG = highs[i]
-    return lastBullFVG, lastBearFVG
-
-def retest_bull_fvg(level: float, low: float, close: float) -> bool:
-    return (not math.isnan(level)) and (low <= level) and (close > level)
-
-def retest_bear_fvg(level: float, high: float, close: float) -> bool:
-    return (not math.isnan(level)) and (high >= level) and (close < level)
-
-def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
-                lastHigh: float, lastLow: float,
-                lastBullFVG: float, lastBearFVG: float,
-                ema21_val: float,
-                slStyle: str, tpStyle: str,
-                baseAtrMult: float,
-                manip_flag: bool,
-                trendBull: bool, trendBear: bool,
-                ch50: float) -> tuple[float,float,float,float,float]:
-    """
-    Порт SL/TP частини з Pine (для нового сигналу).
-    idx - індекс останньої закритої свічки.
-    """
-    close = float(df.loc[idx, "close"])
-    high  = float(df.loc[idx, "high"])
-    low   = float(df.loc[idx, "low"])
-
-    atr5 = float(df.loc[idx, "atr5"])
-    atr14 = float(df.loc[idx, "atr14"])
-
-    # 1) styleMult
-    styleMult = 0.5 if slStyle == "Aggressive" else (1.0 if slStyle == "Normal" else 1.5)
-
-    # 2) dynMult (спрощено 1:1 за умовами Pine)
-    dynMult = 1.0
-    if manip_flag:
-        dynMult += 0.4
-
-    dist21 = abs(close - ema21_val) / close
-    dist50 = abs(close - float(df.loc[idx, "ema50"])) / close
-
-    if dist21 < 0.004:
-        dynMult -= 0.25
-    elif dist50 < 0.006:
-        dynMult -= 0.15
-
-    dynMult = max(0.5, min(dynMult, 2.0))
-
-    slAtrMult = baseAtrMult * styleMult * dynMult
-    slAtr = atr5 * slAtrMult
-
-    entry = close
-
-    if dir_active == 1:
-        # BUY
-        refLow1 = low
-        refLow2 = low if math.isnan(lastLow) else lastLow
-
-        if slStyle == "Aggressive":
-            rawSL = refLow1
-        elif slStyle == "Normal":
-            rawSL = min(refLow1, refLow2)
-        else:
-            rawSL = refLow2
-
-        sl = rawSL - slAtr
-
-        risk = entry - sl
-        if risk <= 0:
-            sl = entry - atr14
-            risk = entry - sl
-
-        tp1_R = entry + risk * 1.0
-        tp2_R = entry + risk * 2.0
-        tp3_R = entry + risk * 3.0
-        if trendBull and ch50 > 0.15:
-            tp3_R = entry + risk * 4.0
-
-        candHigh1 = lastHigh if (not math.isnan(lastHigh) and lastHigh > entry) else np.nan
-        candHigh2 = lastBearFVG if (not math.isnan(lastBearFVG) and lastBearFVG > entry) else np.nan
-
-        structNear = np.nan
-        structFar  = np.nan
-        cands = [x for x in [candHigh1, candHigh2] if not math.isnan(x)]
-        if cands:
-            structNear = min(cands)
-            structFar  = max(cands)
-
-        if tpStyle == "R-multiple":
-            tp1, tp2, tp3 = tp1_R, tp2_R, tp3_R
-        elif tpStyle == "Structural":
-            tp1 = tp1_R if math.isnan(structNear) else structNear
-            tp2 = tp2_R if math.isnan(structFar)  else structFar
-            tp3 = tp3_R
-        else:  # Combined
-            tp1 = tp1_R
-            tp2 = tp2_R if math.isnan(structNear) else structNear
-            tp3 = tp3_R if math.isnan(structFar)  else structFar
-
-        return entry, sl, tp1, tp2, tp3
-
-    else:
-        # SELL
-        refHigh1 = high
-        refHigh2 = high if math.isnan(lastHigh) else lastHigh
-
-        if slStyle == "Aggressive":
-            rawSL = refHigh1
-        elif slStyle == "Normal":
-            rawSL = max(refHigh1, refHigh2)
-        else:
-            rawSL = refHigh2
-
-        sl = rawSL + slAtr
-
-        risk = sl - entry
-        if risk <= 0:
-            sl = entry + atr14
-            risk = sl - entry
-
-        tp1_R = entry - risk * 1.0
-        tp2_R = entry - risk * 2.0
-        tp3_R = entry - risk * 3.0
-        if trendBear and ch50 < -0.15:
-            tp3_R = entry - risk * 4.0
-
-        candLow1 = lastLow if (not math.isnan(lastLow) and lastLow < entry) else np.nan
-        candLow2 = lastBullFVG if (not math.isnan(lastBullFVG) and lastBullFVG < entry) else np.nan
-
-        structNear = np.nan
-        structFar  = np.nan
-        cands = [x for x in [candLow1, candLow2] if not math.isnan(x)]
-        if cands:
-            structNear = max(cands)
-            structFar  = min(cands)
-
-        if tpStyle == "R-multiple":
-            tp1, tp2, tp3 = tp1_R, tp2_R, tp3_R
-        elif tpStyle == "Structural":
-            tp1 = tp1_R if math.isnan(structNear) else structNear
-            tp2 = tp2_R if math.isnan(structFar)  else structFar
-            tp3 = tp3_R
-        else:  # Combined
-            tp1 = tp1_R
-            tp2 = tp2_R if math.isnan(structNear) else structNear
-            tp3 = tp3_R if math.isnan(structFar)  else structFar
-
-        return entry, sl, tp1, tp2, tp3
-
-def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | None:
-    # Працюємо по останній ЗАКРИТІЙ свічці
-    if len(df) < 220:
+def safe_float(x: object) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
         return None
 
-    # якщо only_close: беремо передостанній рядок (бо останній може формуватись)
-    idx = df.index[-2] if STATE["only_close"] else df.index[-1]
+# ==============================
+# 📈 CORE LOGIC (Pine → Python)
+# ==============================
 
-    # ---------------- PD ----------------
-    pdLen = STATE["pdLen"]
-    window = df.loc[:idx].tail(pdLen)
-    sHigh = float(window["high"].max())
-    sLow  = float(window["low"].min())
+@dataclass
+class SignalResult:
+    bull: bool
+    bear: bool
+    style: str
+    entry: Optional[float]
+    sl: Optional[float]
+    tp1: Optional[float]
+    tp2: Optional[float]
+    tp3: Optional[float]
+    deal_status: str
+    extra: Dict[str, str]
+
+def compute_signal(df: pd.DataFrame, cfg: SniperConfig) -> SignalResult:
+    if len(df) < max(250, cfg.pdLen + 10, cfg.structLen * 4, cfg.bosLookback + 10):
+        return SignalResult(False, False, "—", None, None, None, None, None, "Недостатньо даних", {})
+
+    idx = -2 if cfg.onlyClose else -1  # як barstate.isconfirmed
+    dfv = df.copy()
+
+    # PD zone
+    sHigh = dfv["high"].rolling(cfg.pdLen).max()
+    sLow = dfv["low"].rolling(cfg.pdLen).min()
     midPD = (sHigh + sLow) / 2.0
 
-    close = float(df.loc[idx, "close"])
-    high  = float(df.loc[idx, "high"])
-    low   = float(df.loc[idx, "low"])
+    inDiscount = dfv["close"] < midPD
+    inPremium = dfv["close"] > midPD
 
-    inDiscount = close < midPD
-    inPremium  = close > midPD
+    # Sweeps
+    liqLow = dfv["low"] < dfv["low"].shift(1).rolling(5).min()
+    liqHigh = dfv["high"] > dfv["high"].shift(1).rolling(5).max()
 
-    # ---------------- sweeps (liq) ----------------
-    prev5 = df.loc[:idx].tail(6).iloc[:-1]  # 5 барів ДО поточного
-    liqLow  = low  < float(prev5["low"].min())
-    liqHigh = high > float(prev5["high"].max())
+    # ATR candle filter: (high-low) >= ATR14*0.6
+    atr14 = atr(dfv, 14)
+    atrPass = (~cfg.useATR) | ((dfv["high"] - dfv["low"]) >= (atr14 * 0.6))
 
-    # ---------------- ATR pass ----------------
-    atr14 = float(df.loc[idx, "atr14"])
-    atrPass = (not STATE["use_atr"]) or ((high - low) >= atr14 * 0.6)
+    # FVG
+    bullFVG = dfv["high"].shift(2) < dfv["low"]
+    bearFVG = dfv["low"].shift(2) > dfv["high"]
 
-    # ---------------- FVG ----------------
-    lastBullFVG, lastBearFVG = compute_last_fvg_levels(df.loc[:idx].copy())
-    bullRetestFVG_A = retest_bull_fvg(lastBearFVG, low, close)   # bull ретест верхнього FVG
-    bearRetestFVG_A = retest_bear_fvg(lastBullFVG, high, close)  # bear ретест нижнього FVG
+    lastBullFVG = pd.Series(np.nan, index=dfv.index, dtype="float64")
+    lastBearFVG = pd.Series(np.nan, index=dfv.index, dtype="float64")
 
-    # ---------------- EMA filters ----------------
-    ema9   = float(df.loc[idx, "ema9"])
-    ema21  = float(df.loc[idx, "ema21"])
-    ema50  = float(df.loc[idx, "ema50"])
-    ema200 = float(df.loc[idx, "ema200"])
+    cur_bull = np.nan
+    cur_bear = np.nan
+    for i in range(len(dfv)):
+        if bool(bullFVG.iat[i]):
+            cur_bull = dfv["low"].iat[i]
+        if bool(bearFVG.iat[i]):
+            cur_bear = dfv["high"].iat[i]
+        lastBullFVG.iat[i] = cur_bull
+        lastBearFVG.iat[i] = cur_bear
 
-    trendBull = (ema50 > ema200) and (close > ema50)
-    trendBear = (ema50 < ema200) and (close < ema50)
+    # EMA
+    ema9 = ema(dfv["close"], 9)
+    ema21 = ema(dfv["close"], 21)
+    ema50 = ema(dfv["close"], 50)
+    ema200 = ema(dfv["close"], 200)
+
+    trendBull = (ema50 > ema200) & (dfv["close"] > ema50)
+    trendBear = (ema50 < ema200) & (dfv["close"] < ema50)
 
     confirmBull = ema9 > ema21
     confirmBear = ema9 < ema21
 
-    finalBull_OK = (not STATE["use_ema_trend"] or trendBull) and (not STATE["use_ema_confirm"] or confirmBull)
-    finalBear_OK = (not STATE["use_ema_trend"] or trendBear) and (not STATE["use_ema_confirm"] or confirmBear)
+    finalBull_OK = ((~cfg.useEMAtrend) | trendBull) & ((~cfg.useEMAconfirm) | confirmBull)
+    finalBear_OK = ((~cfg.useEMAtrend) | trendBear) & ((~cfg.useEMAconfirm) | confirmBear)
 
-    # ---------------- STRUCT pivots + lastHigh/lastLow ----------------
-    # Піводи вже пораховані в df["ph"]/df["pl"]
-    sub = df.loc[:idx]
-    lastHigh = sub["lastHigh"].iloc[-1]
-    lastLow  = sub["lastLow"].iloc[-1]
+    pullbackEMA21_bull = (dfv["low"] <= ema21) & (dfv["close"] > ema21)
+    pullbackEMA21_bear = (dfv["high"] >= ema21) & (dfv["close"] < ema21)
 
-    # ---------------- BOS ICT ----------------
-    bosLookback = STATE["bosLookback"]
-    prevN = sub.tail(bosLookback + 1).iloc[:-1]
-    bosUpIct   = liqLow  and (close > float(prevN["high"].max()))
-    bosDownIct = liqHigh and (close < float(prevN["low"].min()))
+    # Structure pivots
+    ph = pivot_high(dfv["high"], cfg.structLen, cfg.structLen)
+    pl = pivot_low(dfv["low"], cfg.structLen, cfg.structLen)
 
-    # ---------------- Manip (SPRING/UTAD) ----------------
-    # У Pine: bosUpAfterSweep = sweepLow and close > lastHigh
-    # Тут: якщо є sweepLow і lastHigh валідний і close вище
-    manipBuy = STATE["use_manip"] and liqLow and (not pd.isna(lastHigh)) and (close > float(lastHigh))
-    manipSell = STATE["use_manip"] and liqHigh and (not pd.isna(lastLow)) and (close < float(lastLow))
-    manip_flag = manipBuy or manipSell
+    lastHigh = np.nan
+    prevHigh = np.nan
+    lastLow = np.nan
+    prevLow = np.nan
+    for i in range(len(dfv)):
+        if not math.isnan(ph.iat[i]):
+            prevHigh, lastHigh = lastHigh, ph.iat[i]
+        if not math.isnan(pl.iat[i]):
+            prevLow, lastLow = lastLow, pl.iat[i]
 
-    # ---------------- Entry A/B/C ----------------
-    usePD = STATE["use_pd"]
-    useFVG = STATE["use_fvg"]
+    hasStruct = not any(map(lambda x: (x is None) or math.isnan(x), [lastHigh, prevHigh, lastLow, prevLow]))
+    structUp = hasStruct and (lastHigh > prevHigh) and (lastLow > prevLow)
+    structDown = hasStruct and (lastHigh < prevHigh) and (lastLow < prevLow)
 
-    bullA = bosUpIct   and (bullRetestFVG_A if useFVG else True) and (not usePD or inDiscount) and finalBull_OK and atrPass
-    bearA = bosDownIct and (bearRetestFVG_A if useFVG else True) and (not usePD or inPremium)  and finalBear_OK and atrPass
+    close_i = float(dfv["close"].iat[idx])
+    low_i = float(dfv["low"].iat[idx])
+    high_i = float(dfv["high"].iat[idx])
 
-    bullB = bosUpIct   and (not usePD or inDiscount) and finalBull_OK and atrPass
-    bearB = bosDownIct and (not usePD or inPremium)  and finalBear_OK and atrPass
+    isHL = hasStruct and (lastLow > prevLow)
+    isLH = hasStruct and (lastHigh < prevHigh)
 
-    bullC = bosUpIct   and atrPass
-    bearC = bosDownIct and atrPass
+    # Manipulations SPRING/UTAD
+    sweepLow = bool(liqLow.iat[idx])
+    sweepHigh = bool(liqHigh.iat[idx])
+
+    bosUpAfterSweep = sweepLow and hasStruct and (close_i > lastHigh)
+    bosDownAfterSweep = sweepHigh and hasStruct and (close_i < lastLow)
+
+    manipBuy = cfg.useManip and bosUpAfterSweep
+    manipSell = cfg.useManip and bosDownAfterSweep
+
+    # ICT BOS (lookback)
+    hi_lb = dfv["high"].shift(1).rolling(cfg.bosLookback).max()
+    lo_lb = dfv["low"].shift(1).rolling(cfg.bosLookback).min()
+
+    bosUpIct = bool(liqLow.iat[idx]) and (close_i > float(hi_lb.iat[idx]))
+    bosDownIct = bool(liqHigh.iat[idx]) and (close_i < float(lo_lb.iat[idx]))
+
+    # FVG retest
+    lastBear = safe_float(lastBearFVG.iat[idx])
+    lastBull = safe_float(lastBullFVG.iat[idx])
+
+    bullRetestFVG_A = (lastBear is not None) and (low_i <= lastBear) and (close_i > lastBear)
+    bearRetestFVG_A = (lastBull is not None) and (high_i >= lastBull) and (close_i < lastBull)
+
+    inDisc_i = bool(inDiscount.iat[idx])
+    inPrem_i = bool(inPremium.iat[idx])
+    atrPass_i = bool(atrPass.iat[idx])
+
+    finalBull_i = bool(finalBull_OK.iat[idx])
+    finalBear_i = bool(finalBear_OK.iat[idx])
+
+    # A/B/C
+    bullA = bosUpIct and (bullRetestFVG_A or bool(pullbackEMA21_bull.iat[idx])) and ((not cfg.usePD) or inDisc_i) and finalBull_i and atrPass_i
+    bearA = bosDownIct and (bearRetestFVG_A or bool(pullbackEMA21_bear.iat[idx])) and ((not cfg.usePD) or inPrem_i) and finalBear_i and atrPass_i
+
+    bullB = bosUpIct and isHL and finalBull_i and atrPass_i
+    bearB = bosDownIct and isLH and finalBear_i and atrPass_i
+
+    bullC = bosUpIct and bool(trendBull.iat[idx]) and atrPass_i
+    bearC = bosDownIct and bool(trendBear.iat[idx]) and atrPass_i
 
     bullSignal = False
     bearSignal = False
@@ -392,242 +312,415 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
     elif bearC:
         bearSignal, entryStyle = True, "C — Aggressive"
 
-    if not (bullSignal or bearSignal):
-        return None
+    entry = close_i if (bullSignal or bearSignal) else None
 
-    # ---------------- SL/TP ----------------
-    if not STATE["use_sltp"]:
-        return None
+    # ===== SL/TP Engine (твоя логіка) =====
+    sl = tp1 = tp2 = tp3 = None
+    deal_status = "Немає активної угоди"
 
-    # ch50 як у Pine: ta.change(ema50,5)/ema50*100
-    ema50_prev5 = float(sub["ema50"].iloc[-6]) if len(sub) >= 6 else ema50
-    ch50 = (ema50 - ema50_prev5) / ema50 * 100.0 if ema50 != 0 else 0.0
+    if cfg.useSLA and entry is not None and hasStruct:
+        style_mult = 0.5 if cfg.slStyle == "Aggressive" else 1.0 if cfg.slStyle == "Normal" else 1.5
 
-    direction = "BUY" if bullSignal else "SELL"
-    dir_active = 1 if bullSignal else -1
+        dyn_mult = 1.0
+        if manipBuy or manipSell:
+            dyn_mult += 0.4
 
-    entry, sl, tp1, tp2, tp3 = sltp_engine(
-        df=df, idx=idx, dir_active=dir_active,
-        lastHigh=float(lastHigh) if not pd.isna(lastHigh) else np.nan,
-        lastLow=float(lastLow) if not pd.isna(lastLow) else np.nan,
-        lastBullFVG=float(lastBullFVG) if not math.isnan(lastBullFVG) else np.nan,
-        lastBearFVG=float(lastBearFVG) if not math.isnan(lastBearFVG) else np.nan,
-        ema21_val=ema21,
-        slStyle=STATE["slStyle"],
-        tpStyle=STATE["tpStyle"],
-        baseAtrMult=float(STATE["baseAtrMult"]),
-        manip_flag=manip_flag,
-        trendBull=trendBull, trendBear=trendBear,
-        ch50=ch50
-    )
+        dist21 = abs(entry - float(ema21.iat[idx])) / entry
+        dist50 = abs(entry - float(ema50.iat[idx])) / entry
+        if dist21 < 0.004:
+            dyn_mult -= 0.25
+        elif dist50 < 0.006:
+            dyn_mult -= 0.15
+        dyn_mult = max(0.5, min(dyn_mult, 2.0))
 
-    info = {
-        "trend": "UP" if trendBull else ("DOWN" if trendBear else "RANGE"),
-        "pd": "DISCOUNT" if inDiscount else ("PREMIUM" if inPremium else "MID"),
-        "liq": "SWEEP_LOW" if liqLow else ("SWEEP_HIGH" if liqHigh else "—"),
-        "manip": "SPRING" if manipBuy else ("UTAD" if manipSell else "—"),
+        slAtrMult = cfg.baseAtrMult * style_mult * dyn_mult
+        atr5 = atr(dfv, 5)
+        slAtr = (float(atr5.iat[idx]) if not math.isnan(float(atr5.iat[idx])) else float(atr14.iat[idx])) * slAtrMult
+
+        ch50 = (ema50.iat[idx] - ema50.iat[idx - 5]) / ema50.iat[idx] * 100 if idx - 5 >= -len(dfv) else 0.0
+
+        if bullSignal:
+            refLow1 = low_i
+            refLow2 = lastLow
+            rawSL = refLow1 if cfg.slStyle == "Aggressive" else min(refLow1, refLow2) if cfg.slStyle == "Normal" else refLow2
+            sl = rawSL - slAtr
+
+            risk = entry - sl
+            if risk <= 0:
+                sl = entry - float(atr14.iat[idx])
+                risk = entry - sl
+
+            tp1_R = entry + risk * 1.0
+            tp2_R = entry + risk * 2.0
+            tp3_R = entry + risk * 3.0
+            if bool(trendBull.iat[idx]) and ch50 > 0.15:
+                tp3_R = entry + risk * 4.0
+
+            candHigh1 = lastHigh if lastHigh > entry else np.nan
+            candHigh2 = lastBear if (lastBear is not None and lastBear > entry) else np.nan
+
+            vals = [v for v in [candHigh1, candHigh2] if not (isinstance(v, float) and math.isnan(v))]
+            structNear = min(vals) if vals else np.nan
+            structFar = max(vals) if vals else np.nan
+
+            if cfg.tpStyle == "R-multiple":
+                tp1, tp2, tp3 = tp1_R, tp2_R, tp3_R
+            elif cfg.tpStyle == "Structural":
+                tp1 = tp1_R if math.isnan(structNear) else float(structNear)
+                tp2 = tp2_R if math.isnan(structFar) else float(structFar)
+                tp3 = tp3_R
+            else:
+                tp1 = tp1_R
+                tp2 = tp2_R if math.isnan(structNear) else float(structNear)
+                tp3 = tp3_R if math.isnan(structFar) else float(structFar)
+
+            deal_status = "BUY активна — угода в роботі"
+
+        elif bearSignal:
+            refHigh1 = high_i
+            refHigh2 = lastHigh
+            rawSLs = refHigh1 if cfg.slStyle == "Aggressive" else max(refHigh1, refHigh2) if cfg.slStyle == "Normal" else refHigh2
+            sl = rawSLs + slAtr
+
+            riskS = sl - entry
+            if riskS <= 0:
+                sl = entry + float(atr14.iat[idx])
+                riskS = sl - entry
+
+            tp1_Rs = entry - riskS * 1.0
+            tp2_Rs = entry - riskS * 2.0
+            tp3_Rs = entry - riskS * 3.0
+            if bool(trendBear.iat[idx]) and ch50 < -0.15:
+                tp3_Rs = entry - riskS * 4.0
+
+            candLow1 = lastLow if lastLow < entry else np.nan
+            candLow2 = lastBull if (lastBull is not None and lastBull < entry) else np.nan
+
+            vals = [v for v in [candLow1, candLow2] if not (isinstance(v, float) and math.isnan(v))]
+            structNearS = max(vals) if vals else np.nan
+            structFarS = min(vals) if vals else np.nan
+
+            if cfg.tpStyle == "R-multiple":
+                tp1, tp2, tp3 = tp1_Rs, tp2_Rs, tp3_Rs
+            elif cfg.tpStyle == "Structural":
+                tp1 = tp1_Rs if math.isnan(structNearS) else float(structNearS)
+                tp2 = tp2_Rs if math.isnan(structFarS) else float(structFarS)
+                tp3 = tp3_Rs
+            else:
+                tp1 = tp1_Rs
+                tp2 = tp2_Rs if math.isnan(structNearS) else float(structNearS)
+                tp3 = tp3_Rs if math.isnan(structFarS) else float(structFarS)
+
+            deal_status = "SELL активна — угода в роботі"
+
+    extra = {
+        "entryStyle": entryStyle,
+        "inPD": ("Discount" if inDisc_i else "Premium" if inPrem_i else "Middle"),
+        "manip": ("SPRING" if manipBuy else "UTAD" if manipSell else "—"),
+        "struct": ("UP" if structUp else "DOWN" if structDown else "RANGE/MIXED"),
     }
 
     return SignalResult(
-        symbol=symbol, tf=tf,
-        direction=direction,
-        entry_style=entryStyle,
-        entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-        info=info
+        bull=bullSignal,
+        bear=bearSignal,
+        style=entryStyle,
+        entry=entry,
+        sl=sl,
+        tp1=tp1, tp2=tp2, tp3=tp3,
+        deal_status=deal_status,
+        extra=extra
     )
 
-def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+# ==============================
+# 📥 DATA (Bybit)
+# ==============================
 
-    df["ema9"] = ema(df["close"], 9)
-    df["ema21"] = ema(df["close"], 21)
-    df["ema50"] = ema(df["close"], 50)
-    df["ema200"] = ema(df["close"], 200)
+async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 350) -> pd.DataFrame:
+    def _fetch():
+        # Bybit swap часто як "BTC/USDT:USDT"
+        market_symbol = symbol.replace("USDT", "/USDT:USDT")
+        try:
+            ohlcv = exchange.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
+        except Exception:
+            market_symbol = symbol.replace("USDT", "/USDT")
+            ohlcv = exchange.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
+        return ohlcv
 
-    df["atr14"] = atr(df, 14)
-    df["atr5"] = atr(df, 5)
-
-    # pivots
-    L = STATE["structLen"]
-    df["ph"] = pivot_high(df["high"], L, L)
-    df["pl"] = pivot_low(df["low"], L, L)
-
-    # lastHigh/lastLow як var в Pine
-    lastHigh = np.nan
-    prevHigh = np.nan
-    lastLow  = np.nan
-    prevLow  = np.nan
-
-    lastHigh_arr = []
-    lastLow_arr = []
-
-    for i in range(len(df)):
-        if not math.isnan(df["ph"].iloc[i]):
-            prevHigh = lastHigh
-            lastHigh = float(df["ph"].iloc[i])
-        if not math.isnan(df["pl"].iloc[i]):
-            prevLow = lastLow
-            lastLow = float(df["pl"].iloc[i])
-        lastHigh_arr.append(lastHigh)
-        lastLow_arr.append(lastLow)
-
-    df["lastHigh"] = lastHigh_arr
-    df["lastLow"] = lastLow_arr
-    return df
+    ohlcv = await asyncio.to_thread(_fetch)
+    return pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
 
 # ==============================
-# 🔎 SYMBOL UNIVERSE
+# 🧩 SETTINGS UI (як на фото)
 # ==============================
-def get_symbols() -> list[str]:
-    if STATE["universe"] == "whitelist":
-        return STATE["whitelist"]
 
-    markets = exchange.load_markets()
-    syms = []
-    for s, m in markets.items():
-        # USDT swap symbols на Bybit в ccxt часто виглядають як "BTC/USDT:USDT"
-        if m.get("swap") and m.get("quote") == "USDT":
-            syms.append(s)
+def _btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
 
-    # top100: приблизно по об'єму не візьмемо ідеально без дод. API,
-    # тому робимо pragmatic: просто перші 100 (або можеш замінити на tickers+sort).
-    if STATE["universe"] == "top100":
-        return syms[:100]
-    return syms
+def build_settings_kb(cfg: SniperConfig) -> InlineKeyboardMarkup:
+    on, off = "✅", "⬜️"
+    def t(v: bool) -> str: return on if v else off
+
+    rows = [
+        [_btn(f"{t(cfg.onlyClose)} Сигнал тільки після закриття", "tog:onlyClose")],
+        [_btn(f"{t(cfg.useEMAtrend)} Фільтр EMA 50/200 (тренд)", "tog:useEMAtrend")],
+        [_btn(f"{t(cfg.usePD)} Premium / Discount зона", "tog:usePD")],
+        [_btn(f"{t(cfg.useLiq)} Забір ліквідності (sweep)", "tog:useLiq")],
+        [_btn(f"{t(cfg.useFVG)} FVG для стилю A", "tog:useFVG")],
+        [_btn(f"{t(cfg.useATR)} ATR фільтр свічки", "tog:useATR")],
+        [_btn(f"pdLen: {cfg.pdLen}", "edit:pdLen"), _btn(f"BOS: {cfg.bosLookback}", "edit:bosLookback")],
+        [_btn(f"structLen: {cfg.structLen}", "edit:structLen")],
+        [_btn(f"{t(cfg.useEMAconfirm)} EMA 9/21 підтвердження імпульсу", "tog:useEMAconfirm")],
+        [_btn(f"{t(cfg.useManip)} Маніпуляції (SPRING/UTAD)", "tog:useManip")],
+        [_btn(f"SL style: {cfg.slStyle}", "cycle:slStyle"), _btn(f"TP style: {cfg.tpStyle}", "cycle:tpStyle")],
+        [_btn(f"ATR SL mult: {cfg.baseAtrMult:.2f}", "edit:baseAtrMult")],
+        [_btn("⬅️ Закрити", "close")]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def cfg_toggle(cfg: SniperConfig, field: str) -> None:
+    if hasattr(cfg, field) and isinstance(getattr(cfg, field), bool):
+        setattr(cfg, field, not getattr(cfg, field))
+
+def cfg_cycle(cfg: SniperConfig, field: str) -> None:
+    if field == "slStyle":
+        opts = ["Aggressive", "Normal", "Safe"]
+        cfg.slStyle = opts[(opts.index(cfg.slStyle) + 1) % len(opts)] if cfg.slStyle in opts else "Normal"
+    elif field == "tpStyle":
+        opts = ["R-multiple", "Structural", "Combined"]
+        cfg.tpStyle = opts[(opts.index(cfg.tpStyle) + 1) % len(opts)] if cfg.tpStyle in opts else "Combined"
+
+def cfg_edit_bump(cfg: SniperConfig, field: str, direction: int) -> None:
+    if field == "pdLen":
+        cfg.pdLen = int(max(10, min(300, cfg.pdLen + direction * 5)))
+    elif field == "bosLookback":
+        cfg.bosLookback = int(max(2, min(30, cfg.bosLookback + direction * 1)))
+    elif field == "structLen":
+        cfg.structLen = int(max(1, min(20, cfg.structLen + direction * 1)))
+    elif field == "baseAtrMult":
+        cfg.baseAtrMult = float(max(0.1, min(5.0, cfg.baseAtrMult + direction * 0.1)))
+
+def build_edit_kb(field: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [_btn("➖", f"bump:{field}:-1"), _btn("➕", f"bump:{field}:1")],
+        [_btn("⬅️ Назад", "back:settings")]
+    ])
 
 # ==============================
-# 📣 Telegram messaging
+# 📣 MESSAGE FORMAT
 # ==============================
-def format_signal(sig: SignalResult) -> str:
-    return (
-        f"🚨 *{sig.direction} ICT*  ({sig.entry_style})\n"
-        f"• *{sig.symbol}*  TF: *{sig.tf}*\n"
-        f"• Entry: `{sig.entry:.6f}`\n"
-        f"• SL: `{sig.sl:.6f}`\n"
-        f"• TP1: `{sig.tp1:.6f}`\n"
-        f"• TP2: `{sig.tp2:.6f}`\n"
-        f"• TP3: `{sig.tp3:.6f}`\n"
-        f"—\n"
-        f"Trend: *{sig.info.get('trend')}* | PD: *{sig.info.get('pd')}* | Liq: *{sig.info.get('liq')}* | Manip: *{sig.info.get('manip')}*"
+
+def fmt_price(x: Optional[float]) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "—"
+    if abs(x) >= 1000:
+        return f"{x:.2f}"
+    if abs(x) >= 1:
+        return f"{x:.4f}"
+    return f"{x:.6f}"
+
+def build_signal_text(symbol: str, tf: str, res: SignalResult) -> str:
+    side = "BUY" if res.bull else "SELL" if res.bear else "—"
+    lines = [
+        f"📌 *ICT Sniper сигнал*: *{side}*",
+        f"• Пара: *{symbol}*  | TF: *{tf}*",
+        f"• Стиль входу: *{res.style}*",
+        f"• PD: `{res.extra.get('inPD','—')}` | Struct: `{res.extra.get('struct','—')}` | Manip: `{res.extra.get('manip','—')}`",
+        "",
+        f"💰 Entry: *{fmt_price(res.entry)}*",
+    ]
+    if res.sl is not None:
+        lines.append(f"🛑 SL: *{fmt_price(res.sl)}*")
+    if res.tp1 is not None:
+        lines.append(f"🎯 TP1: *{fmt_price(res.tp1)}*")
+    if res.tp2 is not None:
+        lines.append(f"🎯 TP2: *{fmt_price(res.tp2)}*")
+    if res.tp3 is not None:
+        lines.append(f"🎯 TP3: *{fmt_price(res.tp3)}*")
+
+    lines += ["", f"📍 Статус: *{res.deal_status}*"]
+    return "\n".join(lines)
+
+# ==============================
+# 🤖 COMMANDS
+# ==============================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE["chat_id"] = update.effective_chat.id
+    await update.message.reply_text(
+        "Готово ✅\n"
+        "Команди:\n"
+        "/run — старт сканера\n"
+        "/stop — стоп\n"
+        "/settings — налаштування як в TradingView\n"
+        "/symbols — показати список пар\n"
+        "/set_symbols BTCUSDT,ETHUSDT,... — задати пари\n"
+        "/tf 15m|1h|4h — таймфрейм\n"
     )
 
-async def send_signal(app: Application, chat_id: int, sig: SignalResult, bar_ts: pd.Timestamp):
-    key = (sig.symbol, sig.tf, sig.direction)
-    last = STATE["last_signal"].get(key)
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: SniperConfig = STATE["cfg"]  # type: ignore
+    await update.message.reply_text("⚙️ Налаштування Alpha Engine v4", reply_markup=build_settings_kb(cfg))
 
-    # антидубль: той же бар — не шлемо
-    ts_ms = int(bar_ts.value // 10**6)
-    if last == ts_ms:
+async def on_settings_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    cfg: SniperConfig = STATE["cfg"]  # type: ignore
+    data = query.data or ""
+
+    if data == "close":
+        await query.edit_message_text("Закрито ✅")
         return
 
-    STATE["last_signal"][key] = ts_ms
-    await app.bot.send_message(chat_id=chat_id, text=format_signal(sig), parse_mode="Markdown")
+    if data.startswith("tog:"):
+        field = data.split(":", 1)[1]
+        cfg_toggle(cfg, field)
+        await query.edit_message_reply_markup(reply_markup=build_settings_kb(cfg))
+        return
+
+    if data.startswith("cycle:"):
+        field = data.split(":", 1)[1]
+        cfg_cycle(cfg, field)
+        await query.edit_message_reply_markup(reply_markup=build_settings_kb(cfg))
+        return
+
+    if data.startswith("edit:"):
+        field = data.split(":", 1)[1]
+        await query.edit_message_text(
+            f"✏️ Зміна `{field}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_edit_kb(field)
+        )
+        return
+
+    if data.startswith("bump:"):
+        _, field, dir_s = data.split(":")
+        cfg_edit_bump(cfg, field, int(dir_s))
+        await query.edit_message_text(
+            f"✏️ Зміна `{field}` → `{getattr(cfg, field)}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_edit_kb(field)
+        )
+        return
+
+    if data == "back:settings":
+        await query.edit_message_text("⚙️ Налаштування Alpha Engine v4", reply_markup=build_settings_kb(cfg))
+        return
+
+async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: SniperConfig = STATE["cfg"]  # type: ignore
+    await update.message.reply_text("Пари:\n" + ", ".join(cfg.symbols))
+
+async def cmd_set_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: SniperConfig = STATE["cfg"]  # type: ignore
+    if not context.args:
+        await update.message.reply_text("Приклад: /set_symbols BTCUSDT,ETHUSDT,SOLUSDT")
+        return
+    raw = " ".join(context.args)
+    parts = [p.strip().upper() for p in raw.replace(";", ",").split(",") if p.strip()]
+    if not parts:
+        await update.message.reply_text("Не бачу пар. Приклад: /set_symbols BTCUSDT,ETHUSDT")
+        return
+    cfg.symbols = tuple(parts)
+    await update.message.reply_text("✅ Оновлено: " + ", ".join(cfg.symbols))
+
+async def cmd_tf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: SniperConfig = STATE["cfg"]  # type: ignore
+    if not context.args:
+        await update.message.reply_text(f"Поточний TF: {cfg.timeframe}\nПриклад: /tf 15m")
+        return
+    tf = context.args[0].strip()
+    allowed = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d"}
+    if tf not in allowed:
+        await update.message.reply_text("Невірний TF. Дозволено: " + ", ".join(sorted(allowed)))
+        return
+    cfg.timeframe = tf
+    await update.message.reply_text("✅ TF = " + tf)
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if STATE["running"]:
+        await update.message.reply_text("Сканер вже працює ✅")
+        return
+    STATE["running"] = True
+    STATE["chat_id"] = update.effective_chat.id
+
+    task = asyncio.create_task(scanner_loop(context.application))
+    STATE["task"] = task
+    await update.message.reply_text("🚀 Запустив сканер. Сигнали прийдуть у цей чат.")
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE["running"] = False
+    task = STATE.get("task")
+    if task:
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    STATE["task"] = None
+    await update.message.reply_text("🛑 Зупинив сканер.")
 
 # ==============================
-# 🔁 Scanner loop
+# 🔁 SCANNER LOOP
 # ==============================
-async def scanner_loop(app: Application):
-    while True:
-        if not STATE["running"] or not STATE["chat_id"]:
-            await asyncio.sleep(1.0)
+
+def _signal_key(symbol: str, tf: str) -> str:
+    return f"{symbol}:{tf}"
+
+async def scanner_loop(app: Application) -> None:
+    while STATE["running"]:
+        cfg: SniperConfig = STATE["cfg"]  # type: ignore
+        chat_id = STATE.get("chat_id")
+        if not chat_id:
+            await asyncio.sleep(cfg.scan_interval_sec)
             continue
 
-        try:
-            symbols = get_symbols()
-            for symbol in symbols:
-                if not STATE["running"]:
-                    break
+        for symbol in cfg.symbols:
+            try:
+                df = await fetch_ohlcv(symbol, cfg.timeframe, limit=350)
+                res = compute_signal(df, cfg)
+                if not (res.bull or res.bear):
+                    continue
 
-                for tf in STATE["tfs"]:
-                    if not STATE["running"]:
-                        break
+                last_ts = int(df["ts"].iat[-2 if cfg.onlyClose else -1])
+                key = _signal_key(symbol, cfg.timeframe)
+                last = STATE["last_signal"].get(key)
 
-                    try:
-                        df = await fetch_ohlcv(symbol, tf, limit=320)
-                        df = prepare_indicators(df)
+                side = "BUY" if res.bull else "SELL"
+                if last and last.get("ts") == last_ts and last.get("side") == side:
+                    continue
 
-                        sig = analyze_symbol(df, symbol, tf)
-                        if sig:
-                            # останній закритий бар
-                            idx = df.index[-2] if STATE["only_close"] else df.index[-1]
-                            bar_ts = df.loc[idx, "ts"]
-                            await send_signal(app, STATE["chat_id"], sig, bar_ts)
+                STATE["last_signal"][key] = {"ts": last_ts, "side": side}
 
-                        # маленька пауза щоб не душити rate limit
-                        await asyncio.sleep(0.08)
+                text = build_signal_text(symbol, cfg.timeframe, res)
+                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
 
-                    except Exception:
-                        # щоб не падало через одну пару
-                        continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # не валимо бота через одну помилку
+                pass
 
-            # пауза між повними проходами (під твій стиль)
-            await asyncio.sleep(3.0)
-
-        except Exception:
-            await asyncio.sleep(3.0)
+        await asyncio.sleep(cfg.scan_interval_sec)
 
 # ==============================
-# 🤖 Telegram commands
+# 🧷 MAIN
 # ==============================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE["chat_id"] = update.effective_chat.id
-    await update.message.reply_text(
-        "Готово ✅\nКоманди:\n"
-        "/startscan — запуск сканера\n"
-        "/stopscan — стоп\n"
-        "/status — статус\n"
-        "/tfs 5m 15m 1h — таймфрейми\n"
-        "/universe top100|all|whitelist — всесвіт пар"
-    )
 
-async def cmd_startscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE["chat_id"] = update.effective_chat.id
-    STATE["running"] = True
-    await update.message.reply_text("Сканер запущено ✅")
+def main() -> None:
+    application = Application.builder().token(TG_TOKEN).build()
 
-async def cmd_stopscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE["running"] = False
-    await update.message.reply_text("Сканер зупинено 🛑")
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("run", cmd_run))
+    application.add_handler(CommandHandler("stop", cmd_stop))
+    application.add_handler(CommandHandler("settings", cmd_settings))
+    application.add_handler(CallbackQueryHandler(on_settings_click))
+    application.add_handler(CommandHandler("symbols", cmd_symbols))
+    application.add_handler(CommandHandler("set_symbols", cmd_set_symbols))
+    application.add_handler(CommandHandler("tf", cmd_tf))
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"running={STATE['running']}\n"
-        f"tfs={STATE['tfs']}\n"
-        f"universe={STATE['universe']}\n"
-        f"only_close={STATE['only_close']}\n"
-        f"SL={STATE['slStyle']} TP={STATE['tpStyle']} ATRmult={STATE['baseAtrMult']}"
-    )
-
-async def cmd_tfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        STATE["tfs"] = context.args
-        await update.message.reply_text(f"TFs встановлено: {STATE['tfs']}")
-    else:
-        await update.message.reply_text(f"Поточні TFs: {STATE['tfs']}")
-
-async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args and context.args[0] in ("top100", "all", "whitelist"):
-        STATE["universe"] = context.args[0]
-        await update.message.reply_text(f"Universe: {STATE['universe']}")
-    else:
-        await update.message.reply_text("Використання: /universe top100|all|whitelist")
-
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("startscan", cmd_startscan))
-    app.add_handler(CommandHandler("stopscan", cmd_stopscan))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("tfs", cmd_tfs))
-    app.add_handler(CommandHandler("universe", cmd_universe))
-
-    # запускаємо scanner loop як background task всередині event loop PTB
-    async def post_init(application: Application):
-        application.create_task(scanner_loop(application))
-
-    app.post_init = post_init
-    app.run_polling(close_loop=False)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
