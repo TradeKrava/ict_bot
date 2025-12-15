@@ -320,7 +320,7 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
 
     # ---------------- ATR pass ----------------
     atr14 = float(df.loc[idx, "atr14"])
-    atrPass = (not STATE["use_atr"]) or ((high - low) >= atr14 * 0.8)
+    atrPass = (not STATE["use_atr"]) or ((high - low) >= atr14 * 0.6)
 
     # ---------------- FVG ----------------
     lastBullFVG, lastBearFVG = compute_last_fvg_levels(df.loc[:idx].copy())
@@ -632,4 +632,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
