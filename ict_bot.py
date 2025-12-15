@@ -699,7 +699,7 @@ async def scanner_loop(app: Application) -> None:
             await asyncio.sleep(cfg.scan_interval_sec)
             continue
 
-        symbols = cfg.symbols
+symbols = cfg.symbols
 if cfg.universe == "all" or not symbols:
     symbols = STATE.get("ALL_SYMBOLS", ())
 
@@ -751,4 +751,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
