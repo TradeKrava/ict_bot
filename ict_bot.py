@@ -728,8 +728,8 @@ for symbol in symbols:
             except Exception:
                 # не валимо бота через одну помилку
                 pass
-
-        await asyncio.sleep(cfg.scan_interval_sec)
+              
+  await asyncio.sleep(cfg.scan_interval_sec)
 
 # ==============================
 # 🧷 MAIN
@@ -751,5 +751,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
