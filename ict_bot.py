@@ -3,10 +3,6 @@ Alpha Engine v4 — PRO ICT Sniper 2025 (Telegram Bot)
 - Bybit USDT Perpetual (ccxt)
 - python-telegram-bot v21+
 
-ВАЖЛИВО:
-  1) Set env var TG_TOKEN with your bot token (НЕ хардкодь токен в коді).
-  2) (Опційно) BYBIT_API_KEY / BYBIT_API_SECRET якщо буде жорсткий rate limit (публічні дані теж працюють).
-
 Run:
   pip install python-telegram-bot==21.* ccxt pandas numpy
   python bot.py
@@ -44,26 +40,29 @@ if not TG_TOKEN:
 # ==============================
 # 📊 BYBIT (USDT PERP)
 # ==============================
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 
 exchange = ccxt.bybit({
     "enableRateLimit": True,
-    "apiKey": BYBIT_API_KEY or "",
-    "secret": BYBIT_API_SECRET or "",
-    "options": {"defaultType": "swap"}
+    "options": {
+        "defaultType": "swap",
+        "adjustForTimeDifference": True
+    }
 })
 async def load_all_usdt_perp_symbols() -> tuple[str, ...]:
     def _load():
-        exchange.load_markets()
+        markets = exchange.fetch_markets()
         symbols = []
-        for m in exchange.markets.values():
+
+        for m in markets:
             if (
                 m.get("quote") == "USDT"
                 and m.get("swap") is True
                 and m.get("active") is True
             ):
-                symbols.append(m["symbol"].replace("/", "").replace(":USDT", ""))
+                sym = m["symbol"]
+                sym = sym.replace("/", "").replace(":USDT", "")
+                symbols.append(sym)
+
         return tuple(sorted(set(symbols)))
 
     return await asyncio.to_thread(_load)
@@ -453,17 +452,20 @@ def compute_signal(df: pd.DataFrame, cfg: SniperConfig) -> SignalResult:
 
 async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 350) -> pd.DataFrame:
     def _fetch():
-        # Bybit swap часто як "BTC/USDT:USDT"
+        # пріоритетний формат Bybit USDT Perp
         market_symbol = symbol.replace("USDT", "/USDT:USDT")
         try:
-            ohlcv = exchange.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
+            return exchange.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
         except Exception:
+            # fallback
             market_symbol = symbol.replace("USDT", "/USDT")
-            ohlcv = exchange.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
-        return ohlcv
+            return exchange.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
 
     ohlcv = await asyncio.to_thread(_fetch)
-    return pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+    return pd.DataFrame(
+        ohlcv,
+        columns=["ts", "open", "high", "low", "close", "volume"]
+    )
 
 # ==============================
 # 🧩 SETTINGS UI (як на фото)
@@ -772,6 +774,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
