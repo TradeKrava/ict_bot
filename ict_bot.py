@@ -65,6 +65,27 @@ STATE = {
     "last_signal": {}
 }
 
+# ==============================
+# ⚙️ RUNTIME SETTINGS (Telegram)
+# ==============================
+SETTINGS_HELP = """
+⚙️ Налаштування:
+
+/set only_close on|off
+/set fvg on|off
+/set atr on|off
+/set atr_mult 0.3-1.2
+/set trend on|off
+/set confirm on|off
+/set pd on|off
+
+/set style aggressive|normal|safe
+/set tps r|struct|combined
+"""
+
+def bool_from_arg(x: str) -> bool:
+    return x.lower() in ("on", "true", "1", "yes")
+
 
 
 # ==============================
@@ -568,6 +589,58 @@ async def scanner_loop(app: Application):
 # ==============================
 # 🤖 Telegram commands
 # ==============================
+
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(SETTINGS_HELP)
+        return
+
+    key, val = context.args[0], context.args[1]
+
+    try:
+        if key == "only_close":
+            STATE["only_close"] = bool_from_arg(val)
+
+        elif key == "fvg":
+            STATE["use_fvg"] = bool_from_arg(val)
+
+        elif key == "atr":
+            STATE["use_atr"] = bool_from_arg(val)
+
+        elif key == "atr_mult":
+            STATE["baseAtrMult"] = float(val)
+
+        elif key == "trend":
+            STATE["use_ema_trend"] = bool_from_arg(val)
+
+        elif key == "confirm":
+            STATE["use_ema_confirm"] = bool_from_arg(val)
+
+        elif key == "pd":
+            STATE["use_pd"] = bool_from_arg(val)
+
+        elif key == "style":
+            STATE["slStyle"] = (
+                "Aggressive" if val == "aggressive"
+                else "Safe" if val == "safe"
+                else "Normal"
+            )
+
+        elif key == "tps":
+            STATE["tpStyle"] = (
+                "R-multiple" if val == "r"
+                else "Structural" if val == "struct"
+                else "Combined"
+            )
+
+        else:
+            raise ValueError
+
+        await update.message.reply_text(f"✅ {key} = {val}")
+
+    except Exception:
+        await update.message.reply_text("❌ Помилка. Напиши /set")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
@@ -620,7 +693,8 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("tfs", cmd_tfs))
     app.add_handler(CommandHandler("universe", cmd_universe))
-
+    app.add_handler(CommandHandler("set", cmd_set))
+    
     # запускаємо scanner loop як background task всередині event loop PTB
     async def post_init(application: Application):
         application.create_task(scanner_loop(application))
@@ -646,4 +720,5 @@ def start_http_server():
 if __name__ == "__main__":
     threading.Thread(target=start_http_server, daemon=True).start()
     main()
+
 
