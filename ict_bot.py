@@ -7,13 +7,22 @@
 import os
 import asyncio
 import math
+import time
+import threading
+from dataclasses import dataclass
+
 import ccxt
 import numpy as np
 import pandas as pd
 
-from dataclasses import dataclass
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackQueryHandler
+
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==============================
 # 🔑 TELEGRAM TOKEN
@@ -37,47 +46,53 @@ STATE = {
     "running": False,
     "chat_id": None,
 
+    # === TIMEFRAMES ===
     "tfs": ["15m", "1h"],
 
+    # === SYMBOLS ===
     "universe": "all",
     "whitelist": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
 
-    "only_close": True,
+    # === CORE FLAGS (1:1 з TradingView) ===
+    "only_close": True,          # ☑ Signal only after close
+    "use_ema_trend": True,       # ☑ EMA 50/200 trend
+    "use_ema_confirm": False,    # ⛔ EMA 9/21
+    "use_pd": False,             # ⛔ Premium / Discount
+    "use_fvg": True,             # ☑ FVG style A
+    "use_atr": True,             # ☑ ATR filter
+    "use_manip": False,          # ⛔ Manipulations
 
-    "use_pd": False,
-    "use_atr": True,
-    "use_fvg": True,
-    "use_manip": False,
-
-    "use_ema_trend": True,
-    "use_ema_confirm": False,
-
+    # === STRUCTURE ===
     "pdLen": 50,
     "bosLookback": 5,
     "structLen": 3,
 
+    # === SL / TP ENGINE ===
     "use_sltp": True,
-    "slStyle": "Normal",
-    "tpStyle": "Combined",
+    "slStyle": "Normal",         # Aggressive | Normal | Safe
+    "tpStyle": "Combined",       # R-multiple | Structural | Combined
     "usePartial": True,
     "baseAtrMult": 0.6,
 
+    # === ANTI-DUPLICATE ===
     "last_signal": {}
 }
+
 
 # ==============================
 # ⚙️ RUNTIME SETTINGS (Telegram)
 # ==============================
 SETTINGS_HELP = """
-⚙️ Налаштування:
+⚙️ Alpha Engine v4 — Settings (1:1 TradingView)
 
-/set only_close on|off
-/set fvg on|off
-/set atr on|off
-/set atr_mult 0.3-1.2
-/set trend on|off
-/set confirm on|off
-/set pd on|off
+/set only_close on|off        — Signal only after close
+/set trend on|off             — EMA 50/200 trend
+/set confirm on|off           — EMA 9/21 confirm
+/set fvg on|off               — FVG style A
+/set atr on|off               — ATR filter
+/set atr_mult 0.3-1.2         — ATR multiplier
+/set pd on|off                — Premium / Discount
+/set manip on|off             — SPRING / UTAD
 
 /set style aggressive|normal|safe
 /set tps r|struct|combined
@@ -86,6 +101,31 @@ SETTINGS_HELP = """
 def bool_from_arg(x: str) -> bool:
     return x.lower() in ("on", "true", "1", "yes")
 
+def settings_keyboard():
+    def chk(x): 
+        return "✅" if x else "❌"
+
+    kb = [
+        [InlineKeyboardButton(f"{chk(STATE['only_close'])} Сигнал тільки після закриття", callback_data="toggle_only_close")],
+        [InlineKeyboardButton(f"{chk(STATE['use_ema_trend'])} EMA 50/200 (тренд)", callback_data="toggle_trend")],
+        [InlineKeyboardButton(f"{chk(STATE['use_pd'])} Premium / Discount зона", callback_data="toggle_pd")],
+        [InlineKeyboardButton(f"{chk(STATE['use_manip'])} Маніпуляції (SPRING/UTAD)", callback_data="toggle_manip")],
+        [InlineKeyboardButton(f"{chk(STATE['use_fvg'])} FVG для стилю A", callback_data="toggle_fvg")],
+        [InlineKeyboardButton(f"{chk(STATE['use_atr'])} ATR фільтр свічки", callback_data="toggle_atr")],
+        [
+            InlineKeyboardButton("SL: Aggressive", callback_data="sl_aggr"),
+            InlineKeyboardButton("SL: Normal", callback_data="sl_normal"),
+            InlineKeyboardButton("SL: Safe", callback_data="sl_safe"),
+        ],
+        [
+            InlineKeyboardButton("TP: R", callback_data="tp_r"),
+            InlineKeyboardButton("TP: Struct", callback_data="tp_struct"),
+            InlineKeyboardButton("TP: Combined", callback_data="tp_comb"),
+        ],
+        [InlineKeyboardButton("⬅️ Закрити", callback_data="close_menu")]
+    ]
+
+    return InlineKeyboardMarkup(kb)
 
 
 # ==============================
@@ -105,7 +145,6 @@ def atr(df: pd.DataFrame, length: int) -> pd.Series:
     return true_range(df).ewm(span=length, adjust=False).mean()
 
 def pivot_high(high: pd.Series, left: int, right: int) -> pd.Series:
-    # Pine ta.pivothigh(high, L, L): значення з'являється на барі (t), але відноситься до t-L
     n = len(high)
     out = np.full(n, np.nan)
     for i in range(left, n - right):
@@ -126,11 +165,10 @@ def pivot_low(low: pd.Series, left: int, right: int) -> pd.Series:
     return pd.Series(out, index=low.index)
 
 # ==============================
-# 📦 Data fetch
+# 📦 Data fetch (НЕ блокує event loop)
 # ==============================
 async def fetch_ohlcv(symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
-    # ccxt sync -> в asyncio винесемо в thread, але для простоти тут run_in_executor не робимо.
-    data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+    data = await asyncio.to_thread(exchange.fetch_ohlcv, symbol, tf, None, limit)
     df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     return df
@@ -152,8 +190,6 @@ class SignalResult:
     info: dict
 
 def compute_last_fvg_levels(df: pd.DataFrame):
-    # bullFVG = high[2] < low  -> lastBullFVG := low
-    # bearFVG = low[2] > high  -> lastBearFVG := high
     lastBullFVG = np.nan
     lastBearFVG = np.nan
     highs = df["high"].values
@@ -182,10 +218,7 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
                 manip_flag: bool,
                 trendBull: bool, trendBear: bool,
                 ch50: float) -> tuple[float,float,float,float,float]:
-    """
-    Порт SL/TP частини з Pine (для нового сигналу).
-    idx - індекс останньої закритої свічки.
-    """
+
     close = float(df.loc[idx, "close"])
     high  = float(df.loc[idx, "high"])
     low   = float(df.loc[idx, "low"])
@@ -193,10 +226,8 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
     atr5 = float(df.loc[idx, "atr5"])
     atr14 = float(df.loc[idx, "atr14"])
 
-    # 1) styleMult
     styleMult = 0.5 if slStyle == "Aggressive" else (1.0 if slStyle == "Normal" else 1.5)
 
-    # 2) dynMult (спрощено 1:1 за умовами Pine)
     dynMult = 1.0
     if manip_flag:
         dynMult += 0.4
@@ -217,7 +248,6 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
     entry = close
 
     if dir_active == 1:
-        # BUY
         refLow1 = low
         refLow2 = low if math.isnan(lastLow) else lastLow
 
@@ -265,7 +295,6 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
         return entry, sl, tp1, tp2, tp3
 
     else:
-        # SELL
         refHigh1 = high
         refHigh2 = high if math.isnan(lastHigh) else lastHigh
 
@@ -313,14 +342,11 @@ def sltp_engine(df: pd.DataFrame, idx: int, dir_active: int,
         return entry, sl, tp1, tp2, tp3
 
 def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | None:
-    # Працюємо по останній ЗАКРИТІЙ свічці
     if len(df) < 220:
         return None
 
-    # якщо only_close: беремо передостанній рядок (бо останній може формуватись)
     idx = df.index[-2] if STATE["only_close"] else df.index[-1]
 
-    # ---------------- PD ----------------
     pdLen = STATE["pdLen"]
     window = df.loc[:idx].tail(pdLen)
     sHigh = float(window["high"].max())
@@ -334,21 +360,17 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
     inDiscount = close < midPD
     inPremium  = close > midPD
 
-    # ---------------- sweeps (liq) ----------------
-    prev5 = df.loc[:idx].tail(6).iloc[:-1]  # 5 барів ДО поточного
+    prev5 = df.loc[:idx].tail(6).iloc[:-1]
     liqLow  = low  < float(prev5["low"].min())
     liqHigh = high > float(prev5["high"].max())
 
-    # ---------------- ATR pass ----------------
     atr14 = float(df.loc[idx, "atr14"])
     atrPass = (not STATE["use_atr"]) or ((high - low) >= atr14 * 0.8)
 
-    # ---------------- FVG ----------------
     lastBullFVG, lastBearFVG = compute_last_fvg_levels(df.loc[:idx].copy())
-    bullRetestFVG_A = retest_bull_fvg(lastBearFVG, low, close)   # bull ретест верхнього FVG
-    bearRetestFVG_A = retest_bear_fvg(lastBullFVG, high, close)  # bear ретест нижнього FVG
+    bullRetestFVG_A = retest_bull_fvg(lastBearFVG, low, close)
+    bearRetestFVG_A = retest_bear_fvg(lastBullFVG, high, close)
 
-    # ---------------- EMA filters ----------------
     ema9   = float(df.loc[idx, "ema9"])
     ema21  = float(df.loc[idx, "ema21"])
     ema50  = float(df.loc[idx, "ema50"])
@@ -363,26 +385,19 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
     finalBull_OK = (not STATE["use_ema_trend"] or trendBull) and (not STATE["use_ema_confirm"] or confirmBull)
     finalBear_OK = (not STATE["use_ema_trend"] or trendBear) and (not STATE["use_ema_confirm"] or confirmBear)
 
-    # ---------------- STRUCT pivots + lastHigh/lastLow ----------------
-    # Піводи вже пораховані в df["ph"]/df["pl"]
     sub = df.loc[:idx]
     lastHigh = sub["lastHigh"].iloc[-1]
     lastLow  = sub["lastLow"].iloc[-1]
 
-    # ---------------- BOS ICT ----------------
     bosLookback = STATE["bosLookback"]
     prevN = sub.tail(bosLookback + 1).iloc[:-1]
     bosUpIct   = liqLow  and (close > float(prevN["high"].max()))
     bosDownIct = liqHigh and (close < float(prevN["low"].min()))
 
-    # ---------------- Manip (SPRING/UTAD) ----------------
-    # У Pine: bosUpAfterSweep = sweepLow and close > lastHigh
-    # Тут: якщо є sweepLow і lastHigh валідний і close вище
     manipBuy = STATE["use_manip"] and liqLow and (not pd.isna(lastHigh)) and (close > float(lastHigh))
     manipSell = STATE["use_manip"] and liqHigh and (not pd.isna(lastLow)) and (close < float(lastLow))
     manip_flag = manipBuy or manipSell
 
-    # ---------------- Entry A/B/C ----------------
     usePD = STATE["use_pd"]
     useFVG = STATE["use_fvg"]
 
@@ -415,11 +430,9 @@ def analyze_symbol(df: pd.DataFrame, symbol: str, tf: str) -> SignalResult | Non
     if not (bullSignal or bearSignal):
         return None
 
-    # ---------------- SL/TP ----------------
     if not STATE["use_sltp"]:
         return None
 
-    # ch50 як у Pine: ta.change(ema50,5)/ema50*100
     ema50_prev5 = float(sub["ema50"].iloc[-6]) if len(sub) >= 6 else ema50
     ch50 = (ema50 - ema50_prev5) / ema50 * 100.0 if ema50 != 0 else 0.0
 
@@ -467,12 +480,10 @@ def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr14"] = atr(df, 14)
     df["atr5"] = atr(df, 5)
 
-    # pivots
     L = STATE["structLen"]
     df["ph"] = pivot_high(df["high"], L, L)
     df["pl"] = pivot_low(df["low"], L, L)
 
-    # lastHigh/lastLow як var в Pine
     lastHigh = np.nan
     prevHigh = np.nan
     lastLow  = np.nan
@@ -496,21 +507,37 @@ def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================
-# 🔎 SYMBOL UNIVERSE
+# 🔎 SYMBOL UNIVERSE (кеш markets)
 # ==============================
-def get_symbols() -> list[str]:
+_MARKETS_CACHE = {"ts": 0.0, "syms_all": []}
+
+async def _load_symbols_all_usdt_swaps() -> list[str]:
+    def _sync_load():
+        markets = exchange.load_markets()
+        syms = []
+        for s, m in markets.items():
+            if m.get("swap") and m.get("quote") == "USDT":
+                syms.append(s)
+        return syms
+
+    return await asyncio.to_thread(_sync_load)
+
+async def get_symbols() -> list[str]:
     if STATE["universe"] == "whitelist":
         return STATE["whitelist"]
 
-    markets = exchange.load_markets()
-    syms = []
-    for s, m in markets.items():
-        # USDT swap symbols на Bybit в ccxt часто виглядають як "BTC/USDT:USDT"
-        if m.get("swap") and m.get("quote") == "USDT":
-            syms.append(s)
+    now = time.time()
+    # оновлюємо список ринків раз на 20 хв (щоб не душити Bybit)
+    if (now - _MARKETS_CACHE["ts"] > 20 * 60) or (not _MARKETS_CACHE["syms_all"]):
+        try:
+            _MARKETS_CACHE["syms_all"] = await _load_symbols_all_usdt_swaps()
+            _MARKETS_CACHE["ts"] = now
+            print(f"[markets] loaded: {len(_MARKETS_CACHE['syms_all'])} symbols")
+        except Exception as e:
+            print(f"[markets] load error: {e}")
 
-    # top100: приблизно по об'єму не візьмемо ідеально без дод. API,
-    # тому робимо pragmatic: просто перші 100 (або можеш замінити на tickers+sort).
+    syms = _MARKETS_CACHE["syms_all"]
+
     if STATE["universe"] == "top100":
         return syms[:100]
     return syms
@@ -535,25 +562,30 @@ async def send_signal(app: Application, chat_id: int, sig: SignalResult, bar_ts:
     key = (sig.symbol, sig.tf, sig.direction)
     last = STATE["last_signal"].get(key)
 
-    # антидубль: той же бар — не шлемо
     ts_ms = int(bar_ts.value // 10**6)
     if last == ts_ms:
         return
 
     STATE["last_signal"][key] = ts_ms
-    await app.bot.send_message(chat_id=chat_id, text=format_signal(sig), parse_mode="Markdown")
+    await app.bot.send_message(
+        chat_id=chat_id,
+        text=format_signal(sig),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 # ==============================
 # 🔁 Scanner loop
 # ==============================
 async def scanner_loop(app: Application):
+    print("[scanner] loop started")
     while True:
         if not STATE["running"] or not STATE["chat_id"]:
             await asyncio.sleep(1.0)
             continue
 
         try:
-            symbols = get_symbols()
+            symbols = await get_symbols()
+
             for symbol in symbols:
                 if not STATE["running"]:
                     break
@@ -568,27 +600,70 @@ async def scanner_loop(app: Application):
 
                         sig = analyze_symbol(df, symbol, tf)
                         if sig:
-                            # останній закритий бар
                             idx = df.index[-2] if STATE["only_close"] else df.index[-1]
                             bar_ts = df.loc[idx, "ts"]
                             await send_signal(app, STATE["chat_id"], sig, bar_ts)
 
-                        # маленька пауза щоб не душити rate limit
-                        await asyncio.sleep(0.08)
+                        await asyncio.sleep(0.10)
 
-                    except Exception:
-                        # щоб не падало через одну пару
+                    except Exception as e:
+                        # щоб не падало через одну пару, але ти бачив причину
+                        print(f"[pair-error] {symbol} {tf}: {e}")
                         continue
 
-            # пауза між повними проходами (під твій стиль)
             await asyncio.sleep(3.0)
 
-        except Exception:
+        except Exception as e:
+            print(f"[scanner-error] {e}")
             await asyncio.sleep(3.0)
 
 # ==============================
 # 🤖 Telegram commands
 # ==============================
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚙️ Налаштування Alpha Engine v4",
+        reply_markup=settings_keyboard()
+    )
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    d = q.data
+
+    if d == "toggle_only_close":
+        STATE["only_close"] = not STATE["only_close"]
+    elif d == "toggle_trend":
+        STATE["use_ema_trend"] = not STATE["use_ema_trend"]
+    elif d == "toggle_pd":
+        STATE["use_pd"] = not STATE["use_pd"]
+    elif d == "toggle_manip":
+        STATE["use_manip"] = not STATE["use_manip"]
+    elif d == "toggle_fvg":
+        STATE["use_fvg"] = not STATE["use_fvg"]
+    elif d == "toggle_atr":
+        STATE["use_atr"] = not STATE["use_atr"]
+
+    elif d == "sl_aggr":
+        STATE["slStyle"] = "Aggressive"
+    elif d == "sl_normal":
+        STATE["slStyle"] = "Normal"
+    elif d == "sl_safe":
+        STATE["slStyle"] = "Safe"
+
+    elif d == "tp_r":
+        STATE["tpStyle"] = "R-multiple"
+    elif d == "tp_struct":
+        STATE["tpStyle"] = "Structural"
+    elif d == "tp_comb":
+        STATE["tpStyle"] = "Combined"
+
+    elif d == "close_menu":
+        await q.message.delete()
+        return
+
+    await q.message.edit_reply_markup(reply_markup=settings_keyboard())
 
 async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
@@ -600,44 +675,36 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if key == "only_close":
             STATE["only_close"] = bool_from_arg(val)
-
         elif key == "fvg":
             STATE["use_fvg"] = bool_from_arg(val)
-
         elif key == "atr":
             STATE["use_atr"] = bool_from_arg(val)
-
         elif key == "atr_mult":
             STATE["baseAtrMult"] = float(val)
-
         elif key == "trend":
             STATE["use_ema_trend"] = bool_from_arg(val)
-
         elif key == "confirm":
             STATE["use_ema_confirm"] = bool_from_arg(val)
-
         elif key == "pd":
             STATE["use_pd"] = bool_from_arg(val)
-
+        elif key == "manip":
+            STATE["use_manip"] = bool_from_arg(val)
         elif key == "style":
             STATE["slStyle"] = (
                 "Aggressive" if val == "aggressive"
                 else "Safe" if val == "safe"
                 else "Normal"
             )
-
         elif key == "tps":
             STATE["tpStyle"] = (
                 "R-multiple" if val == "r"
                 else "Structural" if val == "struct"
                 else "Combined"
             )
-
         else:
             raise ValueError
 
         await update.message.reply_text(f"✅ {key} = {val}")
-
     except Exception:
         await update.message.reply_text("❌ Помилка. Напиши /set")
 
@@ -648,14 +715,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/startscan — запуск сканера\n"
         "/stopscan — стоп\n"
         "/status — статус\n"
-        "/tfs 5m 15m 1h — таймфрейми\n"
+        "/tfs 15m 1h — таймфрейми\n"
         "/universe top100|all|whitelist — всесвіт пар"
     )
 
 async def cmd_startscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["chat_id"] = update.effective_chat.id
     STATE["running"] = True
-    await update.message.reply_text("Сканер запущено ✅")
+    await update.message.reply_text("Сканер запущено ✅\n(як з’явиться ICT BUY/SELL — одразу пришлю)")
 
 async def cmd_stopscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["running"] = False
@@ -684,28 +751,9 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Використання: /universe top100|all|whitelist")
 
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("startscan", cmd_startscan))
-    app.add_handler(CommandHandler("stopscan", cmd_stopscan))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("tfs", cmd_tfs))
-    app.add_handler(CommandHandler("universe", cmd_universe))
-    app.add_handler(CommandHandler("set", cmd_set))
-    
-    # запускаємо scanner loop як background task всередині event loop PTB
-    async def post_init(application: Application):
-        application.create_task(scanner_loop(application))
-
-    app.post_init = post_init
-    app.run_polling(close_loop=False)
-
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import os
-
+# ==============================
+# ❤️ Health server (Render)
+# ==============================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -717,8 +765,29 @@ def start_http_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
+# ==============================
+# ▶️ Main
+# ==============================
+def main():
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("startscan", cmd_startscan))
+    app.add_handler(CommandHandler("stopscan", cmd_stopscan))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("tfs", cmd_tfs))
+    app.add_handler(CommandHandler("universe", cmd_universe))
+    app.add_handler(CommandHandler("set", cmd_set))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CallbackQueryHandler(settings_callback))
+
+
+    async def post_init(application: Application):
+        application.create_task(scanner_loop(application))
+
+    app.post_init = post_init
+    app.run_polling(close_loop=False)
+
 if __name__ == "__main__":
     threading.Thread(target=start_http_server, daemon=True).start()
     main()
-
-
