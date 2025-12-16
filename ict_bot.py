@@ -24,6 +24,7 @@ import ccxt
 import numpy as np
 import pandas as pd
 
+from telegram.error import BadRequest
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -111,9 +112,8 @@ STATE: Dict[str, object] = {
     "running": False,
     "chat_id": None,
     "task": None,
-    "last_signal": {},
+    "last_signal": {},   # key=(symbol, tf) -> {"ts": int, "side": "BUY"/"SELL"}
     "cfg": SniperConfig(),
-    "ALL_SYMBOLS": (),
 }
 
 # ==============================
@@ -772,6 +772,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
