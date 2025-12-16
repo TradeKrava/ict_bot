@@ -111,8 +111,9 @@ STATE: Dict[str, object] = {
     "running": False,
     "chat_id": None,
     "task": None,
-    "last_signal": {},   # key=(symbol, tf) -> {"ts": int, "side": "BUY"/"SELL"}
+    "last_signal": {},
     "cfg": SniperConfig(),
+    "ALL_SYMBOLS": (),
 }
 
 # ==============================
@@ -687,6 +688,21 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🛑 Зупинив сканер.")
 
 # ==============================
+# 🔎 SYMBOL SELECTOR (ЄДИНА ЗМІНА)
+# ==============================
+def get_symbols(cfg: SniperConfig) -> Tuple[str, ...]:
+    all_syms = STATE.get("ALL_SYMBOLS", ())
+
+    if cfg.universe == "whitelist":
+        return cfg.whitelist
+
+    if cfg.universe == "top100":
+        return all_syms[:100]
+
+    # default = all
+    return all_syms
+
+# ==============================
 # 🔁 SCANNER LOOP (FIXED)
 # ==============================
 
@@ -702,9 +718,7 @@ async def scanner_loop(app: Application) -> None:
             await asyncio.sleep(cfg.scan_interval_sec)
             continue
 
-        symbols = cfg.symbols
-        if cfg.universe == "all" or not symbols:
-            symbols = STATE.get("ALL_SYMBOLS", ())
+        symbols = get_symbols(cfg)
 
         for symbol in symbols:
             try:
@@ -758,6 +772,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
