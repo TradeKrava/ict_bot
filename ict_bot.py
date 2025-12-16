@@ -46,11 +46,11 @@ if not TG_TOKEN:
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 
-exchange = ccxt.bybit({
+exchange = ccxt.binance({
     "enableRateLimit": True,
-    "apiKey": BYBIT_API_KEY or "",
-    "secret": BYBIT_API_SECRET or "",
-    "options": {"defaultType": "swap"}  # USDT Perpetual
+    "options": {
+        "defaultType": "future"
+    }
 })
 async def load_all_usdt_perp_symbols() -> tuple[str, ...]:
     def _load():
@@ -758,6 +758,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
