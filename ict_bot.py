@@ -658,19 +658,21 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if STATE["running"]:
         await update.message.reply_text("Сканер вже працює ✅")
         return
-    STATE["running"] = True
 
-cfg = STATE["cfg"]
-if cfg.universe == "all":
-    await update.message.reply_text("🔎 Завантажую всі USDT Perpetual пари з Bybit...")
-    STATE["ALL_SYMBOLS"] = await load_all_usdt_perp_symbols()
-    await update.message.reply_text(
-        f"✅ Завантажено {len(STATE['ALL_SYMBOLS'])} пар"
-    )
+    STATE["running"] = True
     STATE["chat_id"] = update.effective_chat.id
+    cfg: SniperConfig = STATE["cfg"]  # type: ignore
+
+    if cfg.universe == "all":
+        await update.message.reply_text("🔎 Завантажую всі USDT Perpetual пари з Bybit...")
+        STATE["ALL_SYMBOLS"] = await load_all_usdt_perp_symbols()
+        await update.message.reply_text(
+            f"✅ Завантажено {len(STATE['ALL_SYMBOLS'])} пар"
+        )
 
     task = asyncio.create_task(scanner_loop(context.application))
     STATE["task"] = task
+
     await update.message.reply_text("🚀 Запустив сканер. Сигнали прийдуть у цей чат.")
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -685,7 +687,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🛑 Зупинив сканер.")
 
 # ==============================
-# 🔁 SCANNER LOOP
+# 🔁 SCANNER LOOP (FIXED)
 # ==============================
 
 def _signal_key(symbol: str, tf: str) -> str:
@@ -695,42 +697,47 @@ async def scanner_loop(app: Application) -> None:
     while STATE["running"]:
         cfg: SniperConfig = STATE["cfg"]  # type: ignore
         chat_id = STATE.get("chat_id")
+
         if not chat_id:
             await asyncio.sleep(cfg.scan_interval_sec)
             continue
 
-symbols = cfg.symbols
-if cfg.universe == "all" or not symbols:
-    symbols = STATE.get("ALL_SYMBOLS", ())
+        symbols = cfg.symbols
+        if cfg.universe == "all" or not symbols:
+            symbols = STATE.get("ALL_SYMBOLS", ())
 
-for symbol in symbols:
+        for symbol in symbols:
             try:
                 df = await fetch_ohlcv(symbol, cfg.timeframe, limit=350)
                 res = compute_signal(df, cfg)
+
                 if not (res.bull or res.bear):
                     continue
 
                 last_ts = int(df["ts"].iat[-2 if cfg.onlyClose else -1])
                 key = _signal_key(symbol, cfg.timeframe)
-                last = STATE["last_signal"].get(key)
 
                 side = "BUY" if res.bull else "SELL"
+                last = STATE["last_signal"].get(key)
+
                 if last and last.get("ts") == last_ts and last.get("side") == side:
                     continue
 
                 STATE["last_signal"][key] = {"ts": last_ts, "side": side}
 
                 text = build_signal_text(symbol, cfg.timeframe, res)
-                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
 
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                # не валимо бота через одну помилку
-                pass
-              
-  await asyncio.sleep(cfg.scan_interval_sec)
+            except Exception as e:
+                print(f"[SCAN ERROR] {symbol}: {e}")
 
+        await asyncio.sleep(cfg.scan_interval_sec)
 # ==============================
 # 🧷 MAIN
 # ==============================
@@ -751,6 +758,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
